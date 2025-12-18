@@ -9,7 +9,7 @@ log:
   type: "text" # text, json
 
 obfuscator:
-  target_path: "../FQW" # absolute or relative path to directory with go.mod
+  target_path: "" # absolute or relative path to directory with go.mod
   seed: 0 # 0 to random seed
   comments: true # true, false
   literals:
@@ -22,4 +22,4 @@ builder:
     - "-trimpath"
   goos: "windows"
   goarch: "amd64"
-  output_path: "/home/zefixed/Documents/golang/pop-go" # absolute
+  output_path: "" # absolute
