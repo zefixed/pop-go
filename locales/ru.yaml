@@ -1,0 +1,30 @@
+err.setup.logger: "ошибка при настройке логгера"
+err.temp.dir: "ошибка создания временной директории"
+err.copy.temp.dir: "ошибка копирования проекта во временную директорию"
+
+create.temp.dir: "создана временная директория"
+delete.temp.dir: "удалена временная директория"
+
+starting: "запуск"
+debug.message.enabled: "отладочные сообщения включены"
+shutdown: "корректное завершение работы"
+err.shutdown: "экстренное завершение работы"
+app.stopped: "приложение остановлено"
+invalid.log.level: "недопустимый уровень логирования"
+invalid.log.type: "недопустимый тип логирования"
+
+obf.err.load.pkg: "ошибка загрузки пакета"
+obf.err.pkg: "ошибка пакета"
+obf.err.format: "ошибка форматирования"
+obf.err.write: "ошибка записи"
+
+obf.debug.processing.file: "обработка файла"
+
+obf.info.start.del.comm: "начало удаления комментариев"
+obf.info.end.del.comm: "конец удаления комментариев"
+
+obf.info.start.obf.lit: "начало обфусцирования литералов"
+obf.info.end.obf.lit: "конец обфусцирования литералов"
+
+bld.info.start: "начало сборки"
+bld.info.end: "конец сборки"
