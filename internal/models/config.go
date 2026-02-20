@@ -1,34 +1,39 @@
 package models
 
 type Config struct {
-	App struct {
-		Name         string `yaml:"name"`
-		Version      string `yaml:"version"`
-		Lang         string `yaml:"lang"`
-		TempFolder   string `yaml:"temp_folder"`
-		OutputFolder string `yaml:"output_folder"`
-	} `yaml:"app"`
+	App        App        `json:"app"`
+	Log        Log        `json:"log"`
+	Obfuscator Obfuscator `json:"obfuscator"`
+	Builder    Builder    `json:"builder"`
+	CurLocale  map[string]string
+}
 
-	Log struct {
-		Level string `yaml:"level"`
-		Type  string `yaml:"type"`
-	} `yaml:"log"`
+type App struct {
+	Name       string `json:"name"`
+	Version    string `json:"version"`
+	Lang       string `json:"lang"`
+	TempFolder string `json:"temp_folder"`
+}
 
-	Obfuscator struct {
-		TargetPath string `yaml:"target_path"`
-		Comments   bool   `yaml:"comments"`
-		Seed       int64  `yaml:"seed"`
-		Literals   struct {
-			Level string `yaml:"level"`
-		} `yaml:"literals"`
-	} `yaml:"obfuscator"`
+type Log struct {
+	Level string `json:"level"`
+	Type  string `json:"type"`
+}
 
-	Builder struct {
-		Flags      []string `yaml:"flags"`
-		GOOS       string   `yaml:"goos"`
-		GOARCH     string   `yaml:"goarch"`
-		OutputPath string   `yaml:"output_path"`
-	} `yaml:"builder"`
+type Obfuscator struct {
+	TargetPath string   `json:"target_path"`
+	Comments   bool     `json:"comments"`
+	Seed       int64    `json:"seed"`
+	Literals   Literals `json:"literals"`
+}
 
-	CurLocale map[string]string
+type Literals struct {
+	Level string `json:"level"`
+}
+
+type Builder struct {
+	Flags      []string `json:"flags"`
+	GOOS       string   `json:"goos"`
+	GOARCH     string   `json:"goarch"`
+	OutputPath string   `json:"output_path"`
 }

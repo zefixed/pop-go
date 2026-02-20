@@ -1,21 +1,26 @@
 package config
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
-	"gopkg.in/yaml.v3"
 	"os"
 	"pop-go/internal/models"
 	"strings"
 )
 
-func NewConfig() (*models.Config, error) {
-	data, err := os.ReadFile("config/config.yaml")
+func NewConfig(path string) (*models.Config, error) {
+	if path == "" {
+		return nil, errors.New("empty config path")
+	}
+
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("error read config file: %w", err)
 	}
 
 	var cfg models.Config
-	if err = yaml.Unmarshal(data, &cfg); err != nil {
+	if err = json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("error unmarshal config: %w", err)
 	}
 
@@ -41,7 +46,7 @@ func ValidateConfig(cfg *models.Config) error {
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf(strings.Join(errs, " and "))
+		return errors.New(strings.Join(errs, " and "))
 	}
 
 	return nil
