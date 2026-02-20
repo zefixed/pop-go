@@ -7,10 +7,11 @@
   },
   "log": {
     "level": "debug",
-    "type": "text"
+    "type": "text",
+    "file": "log"
   },
   "obfuscator": {
-    "target_path": "../FQW",
+    "target_path": "../absolute/or/relative/path/to/go.mod",
     "seed": 0,
     "comments": true,
     "literals": {
@@ -21,6 +22,6 @@
     "flags": ["-ldflags", "-s -w", "-trimpath"],
     "goos": "windows",
     "goarch": "amd64",
-    "output_path": "/home/zefixed/Documents/golang/pop-go"
+    "output_path": "/absolute/output/dir/path"
   }
 }
