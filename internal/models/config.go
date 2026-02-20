@@ -18,6 +18,7 @@ type App struct {
 type Log struct {
 	Level string `json:"level"`
 	Type  string `json:"type"`
+	File  string `json:"file"`
 }
 
 type Obfuscator struct {

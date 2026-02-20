@@ -11,7 +11,7 @@ import (
 	"pop-go/internal/models"
 	"pop-go/internal/obfuscator"
 	"pop-go/pkg/fs"
-	"strings"
+	pkglog "pop-go/pkg/log"
 	"syscall"
 )
 
@@ -28,15 +28,16 @@ func Run(cfg *models.Config) {
 	cfg.CurLocale = *locale
 
 	// Logger setup
-	log, err := setupLogger(cfg)
+	log, closer, err := pkglog.SetupLogger(cfg)
 	if err != nil {
-		fmt.Println(fmt.Sprintf("%s: %v", cfg.CurLocale["err.setup.logger"], err))
+		fmt.Println(fmt.Sprintf("%s: %v", cfg.CurLocale["app.err.setup.logger"], err))
 		return
 	}
+	defer closer()
 
 	// Starting message
-	log.Info(fmt.Sprintf("%s %v v%v", cfg.CurLocale["starting"], cfg.App.Name, cfg.App.Version), slog.String("log_level", cfg.Log.Level))
-	log.Debug(cfg.CurLocale["debug.message.enabled"])
+	log.Info(fmt.Sprintf("%s %v v%v", cfg.CurLocale["app.info.starting"], cfg.App.Name, cfg.App.Version), slog.String("log_level", cfg.Log.Level))
+	log.Debug(cfg.CurLocale["app.debug.message.enabled"])
 
 	// Making temporary directory
 	dir, err := makeTempDir(cfg)
@@ -45,16 +46,16 @@ func Run(cfg *models.Config) {
 		return
 	}
 
-	log.Debug(cfg.CurLocale["create.temp.dir"], slog.String("path", dir))
+	log.Debug(cfg.CurLocale["app.debug.create.temp.dir"], slog.String("path", dir))
 	defer func(path string) {
 		os.RemoveAll(path)
-		log.Debug(cfg.CurLocale["delete.temp.dir"], slog.String("path", path))
+		log.Debug(cfg.CurLocale["app.debug.delete.temp.dir"], slog.String("path", path))
 	}(dir)
 
 	// Copying project to temp dir
 	err = fs.CopyDir(cfg.Obfuscator.TargetPath, dir)
 	if err != nil {
-		log.Error(fmt.Sprintf("%s: %s", cfg.CurLocale["err.copy.temp.dir"], err))
+		log.Error(fmt.Sprintf("%s: %s", cfg.CurLocale["app.err.copy.temp.dir"], err))
 		return
 	}
 	cfg.Obfuscator.TargetPath = dir
@@ -64,7 +65,7 @@ func Run(cfg *models.Config) {
 	obf.Obfuscate()
 	if obf.CritErr != nil {
 		stop()
-		log.Info(cfg.CurLocale["err.shutdown"])
+		log.Error(cfg.CurLocale["app.err.shutdown"])
 		return
 	}
 
@@ -72,53 +73,12 @@ func Run(cfg *models.Config) {
 	err = builder.NewBuilder(cfg, log).Build()
 	if err != nil {
 		stop()
-		log.Info(cfg.CurLocale["err.shutdown"])
+		log.Error(cfg.CurLocale["app.err.shutdown"])
 		return
 	}
 
 	stop()
-	log.Info(cfg.CurLocale["shutdown"])
-}
-
-func setupLogger(cfg *models.Config) (*slog.Logger, error) {
-	var log *slog.Logger
-	var err error
-
-	var handler slog.Handler
-	level := getLogLevel(strings.TrimSpace(cfg.Log.Level))
-
-	if level == nil {
-		return nil, fmt.Errorf("%s: %v", cfg.CurLocale["invalid.log.level"], cfg.Log.Level)
-	}
-
-	switch strings.TrimSpace(cfg.Log.Type) {
-	case "text":
-		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: *level})
-	case "json":
-		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: *level})
-	default:
-		return nil, fmt.Errorf("%s: %v", cfg.CurLocale["invalid.log.type"], cfg.Log.Type)
-	}
-
-	log = slog.New(handler)
-	return log, err
-}
-
-func getLogLevel(level string) *slog.Level {
-	var lvl slog.Level
-	switch level {
-	case "debug":
-		lvl = slog.LevelDebug
-	case "info":
-		lvl = slog.LevelInfo
-	case "warn":
-		lvl = slog.LevelWarn
-	case "error":
-		lvl = slog.LevelError
-	default:
-		return nil
-	}
-	return &lvl
+	log.Info(cfg.CurLocale["app.info.shutdown"])
 }
 
 func loadLocales(cfg *models.Config) (*map[string]string, error) {
@@ -146,7 +106,7 @@ func makeTempDir(cfg *models.Config) (string, error) {
 	}
 
 	if err != nil {
-		return "", fmt.Errorf("%s: %w", cfg.CurLocale["err.temp.dir"], err)
+		return "", fmt.Errorf("%s: %w", cfg.CurLocale["app.err.create.temp.dir"], err)
 	}
 
 	return dir, nil
