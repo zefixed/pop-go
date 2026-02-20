@@ -1,0 +1,26 @@
+{
+  "app": {
+    "name": "pop-go",
+    "version": "0.0.1",
+    "lang": "ru",
+    "temp_folder": ""
+  },
+  "log": {
+    "level": "debug",
+    "type": "text"
+  },
+  "obfuscator": {
+    "target_path": "../FQW",
+    "seed": 0,
+    "comments": true,
+    "literals": {
+      "level": "easy"
+    }
+  },
+  "builder": {
+    "flags": ["-ldflags", "-s -w", "-trimpath"],
+    "goos": "windows",
+    "goarch": "amd64",
+    "output_path": "/home/zefixed/Documents/golang/pop-go"
+  }
+}
