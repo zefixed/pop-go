@@ -1,14 +1,14 @@
 package obfuscator
 
-func (o *Obfuscator) Obfuscate() {
+func (o *Obfuscator) Obfuscate() error {
 	if o.cfg.Obfuscator.Comments {
 		o.DeleteComments()
 	}
 
-	switch o.cfg.Obfuscator.Literals.Level {
-	case "none":
-		return
-	case "easy":
-		o.ObfuscateLiteralsEasy()
+	err := o.literals.Obfuscate(o.cfg.Obfuscator.Literals.Level)
+	if err != nil {
+		return err
 	}
+
+	return nil
 }

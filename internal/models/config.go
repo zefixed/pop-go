@@ -9,10 +9,11 @@ type Config struct {
 }
 
 type App struct {
-	Name       string `json:"name"`
-	Version    string `json:"version"`
-	Lang       string `json:"lang"`
-	TempFolder string `json:"temp_folder"`
+	Name                 string `json:"name"`
+	Version              string `json:"version"`
+	Lang                 string `json:"lang"`
+	TempFolder           string `json:"temp_folder"`
+	DeleteTempAfterBuild bool   `json:"delete_temp_after_build"`
 }
 
 type Log struct {

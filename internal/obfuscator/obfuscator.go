@@ -6,13 +6,15 @@ import (
 	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"pop-go/internal/models"
+	"pop-go/internal/obfuscator/literals"
 )
 
 type Obfuscator struct {
-	cfg     *models.Config
-	log     *slog.Logger
-	pkgs    []*packages.Package
-	CritErr error
+	cfg      *models.Config
+	log      *slog.Logger
+	pkgs     []*packages.Package
+	literals *literals.Literals
+	CritErr  error
 }
 
 func NewObfuscator(cfg *models.Config, log *slog.Logger) *Obfuscator {
@@ -24,12 +26,15 @@ func NewObfuscator(cfg *models.Config, log *slog.Logger) *Obfuscator {
 
 	pkgs, err := packages.Load(obfCfg, "./...")
 	if err != nil {
-		log.Error(fmt.Sprintf("%s: %s", cfg.CurLocale["obf.err.load.pkg"], err.Error()))
+		return &Obfuscator{
+			CritErr: fmt.Errorf("%s: %w", cfg.CurLocale["obf.err.load.pkg"], err),
+		}
 	}
 
 	return &Obfuscator{
-		cfg:  cfg,
-		log:  log,
-		pkgs: pkgs,
+		cfg:      cfg,
+		log:      log,
+		pkgs:     pkgs,
+		literals: literals.NewLiterals(cfg, log, pkgs),
 	}
 }
