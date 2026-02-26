@@ -45,12 +45,19 @@ func Run(cfg *models.Config) {
 		log.Error(err.Error())
 		return
 	}
-
 	log.Debug(cfg.CurLocale["app.debug.create.temp.dir"], slog.String("path", dir))
-	defer func(path string) {
-		os.RemoveAll(path)
-		log.Debug(cfg.CurLocale["app.debug.delete.temp.dir"], slog.String("path", path))
-	}(dir)
+
+	// Deleting temp dir if flag is set
+	if cfg.App.DeleteTempAfterBuild {
+		defer func(path string) {
+			err = os.RemoveAll(path)
+			if err != nil {
+				log.Debug(cfg.CurLocale["app.debug.delete.temp.dir.err"], slog.String("path", path))
+			} else {
+				log.Debug(cfg.CurLocale["app.debug.delete.temp.dir"], slog.String("path", path))
+			}
+		}(dir)
+	}
 
 	// Copying project to temp dir
 	err = fs.CopyDir(cfg.Obfuscator.TargetPath, dir)
@@ -62,9 +69,15 @@ func Run(cfg *models.Config) {
 
 	// Starting obfuscation
 	obf := obfuscator.NewObfuscator(cfg, log)
-	obf.Obfuscate()
 	if obf.CritErr != nil {
 		stop()
+		log.Error(obf.CritErr.Error())
+		log.Error(cfg.CurLocale["app.err.shutdown"])
+		return
+	}
+	err = obf.Obfuscate()
+	if err != nil {
+		log.Error(err.Error())
 		log.Error(cfg.CurLocale["app.err.shutdown"])
 		return
 	}
@@ -73,6 +86,7 @@ func Run(cfg *models.Config) {
 	err = builder.NewBuilder(cfg, log).Build()
 	if err != nil {
 		stop()
+		log.Error(err.Error())
 		log.Error(cfg.CurLocale["app.err.shutdown"])
 		return
 	}
