@@ -7,19 +7,28 @@ import (
 	"log/slog"
 	"pop-go/internal/models"
 	"pop-go/internal/obfuscator/literals"
+	"pop-go/internal/obfuscator/renameIdentifiers"
 )
 
 type Obfuscator struct {
-	cfg      *models.Config
-	log      *slog.Logger
-	pkgs     []*packages.Package
-	literals *literals.Literals
-	CritErr  error
+	cfg               *models.Config
+	log               *slog.Logger
+	pkgs              []*packages.Package
+	literals          *literals.Literals
+	renameIdentifiers *renameIdentifiers.RenameIdentifiers
+	CritErr           error
 }
 
 func NewObfuscator(cfg *models.Config, log *slog.Logger) *Obfuscator {
 	obfCfg := &packages.Config{
-		Mode: packages.NeedSyntax | packages.NeedTypes | packages.NeedImports,
+		Mode: packages.NeedName |
+			packages.NeedFiles |
+			packages.NeedCompiledGoFiles |
+			packages.NeedImports |
+			packages.NeedDeps |
+			packages.NeedTypes |
+			packages.NeedTypesInfo |
+			packages.NeedSyntax,
 		Fset: token.NewFileSet(),
 		Dir:  cfg.Obfuscator.TargetPath,
 	}
@@ -32,9 +41,10 @@ func NewObfuscator(cfg *models.Config, log *slog.Logger) *Obfuscator {
 	}
 
 	return &Obfuscator{
-		cfg:      cfg,
-		log:      log,
-		pkgs:     pkgs,
-		literals: literals.NewLiterals(cfg, log, pkgs),
+		cfg:               cfg,
+		log:               log,
+		pkgs:              pkgs,
+		literals:          literals.NewLiterals(cfg, log, pkgs),
+		renameIdentifiers: renameIdentifiers.NewRenameIdentifiers(cfg, log, pkgs),
 	}
 }
