@@ -1,15 +1,12 @@
 package literals
 
 import (
-	"bytes"
 	"fmt"
 	"go/ast"
-	"go/format"
 	"go/parser"
 	"go/token"
 	"golang.org/x/tools/go/ast/astutil"
 	"log/slog"
-	"os"
 	"pop-go/pkg/util"
 	"strconv"
 	"strings"
@@ -34,7 +31,7 @@ func (l *Literals) Obfuscate(level string) error {
 			l.log.Debug(l.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", absPath))
 
 			// Obfuscate literals in file with given obfuscation profile
-			if err := l.obfuscateFile(absPath, profile); err != nil {
+			if err := l.obfuscateAST(file, pkg.Fset, profile); err != nil {
 				return fmt.Errorf(l.cfg.CurLocale["obf.err.lit"], absPath, err)
 			}
 		}
@@ -56,20 +53,12 @@ func getObfuscationProfile(level string) ObfuscateLiteralsProfile {
 	return nil
 }
 
-func (l *Literals) obfuscateFile(filePath string, profile ObfuscateLiteralsProfile) error {
-	// Generate decryption key and function template using seed
+func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile ObfuscateLiteralsProfile) error {
 	decryptKey := profile.GenerateKey(l.cfg.Obfuscator.Seed)
-	decryptFuncName := util.GenerateDecryptFuncName(l.cfg.Obfuscator.Seed)
+	decryptFuncName := util.GenerateUniqueName(l.cfg.Obfuscator.Seed)
 	decryptFunc := profile.DecryptFunction(decryptKey, decryptFuncName)
 
-	// Parse file into AST for analysis
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, filePath, nil, parser.ParseComments)
-	if err != nil {
-		return err
-	}
-
-	// Check for existing decrypt function
+	// Проверка на наличие функции дешифровки
 	hasDecrypt := false
 	for _, decl := range f.Decls {
 		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == decryptFuncName {
@@ -78,7 +67,7 @@ func (l *Literals) obfuscateFile(filePath string, profile ObfuscateLiteralsProfi
 		}
 	}
 
-	// Insert generated decrypt function if missing
+	// Добавляем функцию дешифровки при необходимости
 	if !hasDecrypt {
 		fullCode := "package temp\n" + decryptFunc
 		extra, err := parser.ParseFile(fset, "", fullCode, 0)
@@ -89,7 +78,6 @@ func (l *Literals) obfuscateFile(filePath string, profile ObfuscateLiteralsProfi
 			f.Decls = append(f.Decls, extra.Decls[0])
 		}
 
-		// Add required imports for some profile
 		for _, pkg := range profile.RequiredImports() {
 			if !hasImport(f, pkg) {
 				addImport(f, pkg)
@@ -97,10 +85,9 @@ func (l *Literals) obfuscateFile(filePath string, profile ObfuscateLiteralsProfi
 		}
 	}
 
-	// Process string literals for obfuscation
+	// Обработка строковых литералов
 	astutil.Apply(f, nil, func(cursor *astutil.Cursor) bool {
 		if lit, ok := cursor.Node().(*ast.BasicLit); ok && lit.Kind == token.STRING {
-			// Skip already obfuscated strings
 			parent := cursor.Parent()
 			if call, ok := parent.(*ast.CallExpr); ok {
 				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == decryptFuncName {
@@ -108,12 +95,10 @@ func (l *Literals) obfuscateFile(filePath string, profile ObfuscateLiteralsProfi
 				}
 			}
 
-			// Exclude compiler directives and imports
 			if isCompilerDirective(lit.Value) || isImportString(cursor) {
 				return true
 			}
 
-			// Encrypt string and wrap with decrypt call
 			s, _ := strconv.Unquote(lit.Value)
 			enc := profile.EncryptString(s, decryptKey)
 			newLit := &ast.BasicLit{
@@ -131,12 +116,7 @@ func (l *Literals) obfuscateFile(filePath string, profile ObfuscateLiteralsProfi
 		return true
 	})
 
-	// Format modified AST and write to file
-	var buf bytes.Buffer
-	if err := format.Node(&buf, fset, f); err != nil {
-		return err
-	}
-	return os.WriteFile(filePath, buf.Bytes(), 0644)
+	return nil
 }
 
 func isCompilerDirective(s string) bool {

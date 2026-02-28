@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-func GenerateDecryptFuncName(seed int64) string {
+func GenerateUniqueName(seed int64) string {
 	alphabet := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	if seed == 0 {
 		seed = time.Now().UnixNano()
