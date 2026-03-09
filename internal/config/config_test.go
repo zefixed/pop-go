@@ -20,10 +20,10 @@ func TestValidateConfig(t *testing.T) {
 			"Valid config",
 			&models.Config{
 				App: models.App{
-					Name:       "pop-go",
-					Version:    "0.0.1",
-					Lang:       "ru",
-					TempFolder: "",
+					Name:    "pop-go",
+					Version: "0.0.1",
+					Lang:    "ru",
+					TempDir: "",
 				},
 				Log: models.Log{
 					Level: "debug",
@@ -31,7 +31,7 @@ func TestValidateConfig(t *testing.T) {
 				},
 				Obfuscator: models.Obfuscator{
 					TargetPath: "../FQW",
-					Comments:   true,
+					Comments:   models.Comments{Enable: true},
 					Seed:       0,
 					Literals: models.Literals{
 						Level: "easy",
@@ -51,10 +51,10 @@ func TestValidateConfig(t *testing.T) {
 			"Invalid language",
 			&models.Config{
 				App: models.App{
-					Name:       "pop-go",
-					Version:    "0.0.1",
-					Lang:       "kz",
-					TempFolder: "",
+					Name:    "pop-go",
+					Version: "0.0.1",
+					Lang:    "kz",
+					TempDir: "",
 				},
 				Log: models.Log{
 					Level: "debug",
@@ -62,7 +62,7 @@ func TestValidateConfig(t *testing.T) {
 				},
 				Obfuscator: models.Obfuscator{
 					TargetPath: "../FQW",
-					Comments:   true,
+					Comments:   models.Comments{Enable: true},
 					Seed:       0,
 					Literals: models.Literals{
 						Level: "easy",
@@ -82,10 +82,10 @@ func TestValidateConfig(t *testing.T) {
 			"Empty TargetPath",
 			&models.Config{
 				App: models.App{
-					Name:       "pop-go",
-					Version:    "0.0.1",
-					Lang:       "ru",
-					TempFolder: "",
+					Name:    "pop-go",
+					Version: "0.0.1",
+					Lang:    "ru",
+					TempDir: "",
 				},
 				Log: models.Log{
 					Level: "debug",
@@ -93,7 +93,7 @@ func TestValidateConfig(t *testing.T) {
 				},
 				Obfuscator: models.Obfuscator{
 					TargetPath: "",
-					Comments:   true,
+					Comments:   models.Comments{Enable: true},
 					Seed:       0,
 					Literals: models.Literals{
 						Level: "easy",
@@ -113,10 +113,10 @@ func TestValidateConfig(t *testing.T) {
 			"Invalid language and empty TargetPath",
 			&models.Config{
 				App: models.App{
-					Name:       "pop-go",
-					Version:    "0.0.1",
-					Lang:       "it",
-					TempFolder: "",
+					Name:    "pop-go",
+					Version: "0.0.1",
+					Lang:    "it",
+					TempDir: "",
 				},
 				Log: models.Log{
 					Level: "debug",
@@ -124,7 +124,7 @@ func TestValidateConfig(t *testing.T) {
 				},
 				Obfuscator: models.Obfuscator{
 					TargetPath: "",
-					Comments:   true,
+					Comments:   models.Comments{Enable: true},
 					Seed:       0,
 					Literals: models.Literals{
 						Level: "easy",
@@ -182,7 +182,7 @@ func TestNewConfig(t *testing.T) {
 
 	// Writing valid test config
 	validTestConfigPath := "valid_test_config.json"
-	err = os.WriteFile(tempDir+string(os.PathSeparator)+validTestConfigPath, []byte("{\n  \"app\": {\n    \"name\": \"pop-go\",\n    \"version\": \"0.0.1\",\n    \"lang\": \"ru\",\n    \"temp_folder\": \"\"\n  },\n  \"log\": {\n    \"level\": \"debug\",\n    \"type\": \"text\"\n  },\n  \"obfuscator\": {\n    \"target_path\": \"../FQW\",\n    \"seed\": 0,\n    \"comments\": true,\n    \"literals\": {\n      \"level\": \"easy\"\n    }\n  },\n  \"builder\": {\n    \"flags\": [\"-ldflags\", \"-s -w\", \"-trimpath\"],\n    \"goos\": \"windows\",\n    \"goarch\": \"amd64\",\n    \"output_path\": \"/tmp\"\n  }\n}\n"), 0700)
+	err = os.WriteFile(tempDir+string(os.PathSeparator)+validTestConfigPath, []byte("{\n  \"app\": {\n    \"name\": \"pop-go\",\n    \"version\": \"0.0.1\",\n    \"lang\": \"ru\",\n    \"temp_folder\": \"\"\n  },\n  \"log\": {\n    \"level\": \"debug\",\n    \"type\": \"text\",\n    \"enable_log\": false,\n    \"file\": \".log\"\n  },\n  \"obfuscator\": {\n    \"target_path\": \"../FQW\",\n    \"seed\": 0,\n    \"comments\": {\n      \"enable\": false\n    },\n    \"literals\": {\n      \"level\": \"easy\"\n    }\n  },\n  \"builder\": {\n    \"flags\": [\"-ldflags\", \"-s -w\", \"-trimpath\"],\n    \"goos\": \"windows\",\n    \"goarch\": \"amd64\",\n    \"output_path\": \"/tmp\"\n  }\n}\n"), 0700)
 	if err != nil {
 		t.Error(err)
 	}
@@ -223,21 +223,24 @@ func TestNewConfig(t *testing.T) {
 			tempDir + string(os.PathSeparator) + validTestConfigPath,
 			&models.Config{
 				App: models.App{
-					Name:       "pop-go",
-					Version:    "0.0.1",
-					Lang:       "ru",
-					TempFolder: "",
+					Name:    "pop-go",
+					Version: "0.0.1",
+					Lang:    "ru",
+					TempDir: "",
 				},
 				Log: models.Log{
-					Level: "debug",
-					Type:  "text",
+					Level:      "debug",
+					Type:       "text",
+					EnableFile: false,
+					File:       ".log",
 				},
 				Obfuscator: models.Obfuscator{
 					TargetPath: "../FQW",
-					Comments:   true,
+					Comments:   models.Comments{Enable: false},
 					Seed:       0,
 					Literals: models.Literals{
-						Level: "easy",
+						Enable: false,
+						Level:  "easy",
 					},
 				},
 				Builder: models.Builder{
@@ -258,7 +261,7 @@ func TestNewConfig(t *testing.T) {
 			if tt.errStr != "" {
 				if errCfg != nil {
 					if !strings.Contains(errCfg.Error(), tt.errStr) {
-						t.Errorf("want %s, get %s", tt.errStr, errCfg.Error())
+						t.Errorf("want %s,\nget %s", tt.errStr, errCfg.Error())
 					}
 				} else {
 					t.Errorf("want %s, get nothing", tt.errStr)
@@ -274,7 +277,7 @@ func TestNewConfig(t *testing.T) {
 					t.Errorf("want %v, get nothing", tt.wantCfg)
 				}
 				if !cmp.Equal(tt.wantCfg, newCfg) {
-					t.Errorf("want %v, get %v", tt.wantCfg, newCfg)
+					t.Errorf("want %v,\nget %v", tt.wantCfg, newCfg)
 				}
 			}
 		})

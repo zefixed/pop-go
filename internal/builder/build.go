@@ -4,22 +4,42 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 )
 
 func (b *Builder) Build() error {
 	args := []string{"build"}
 
+	// Adding custom flags
 	if len(b.cfg.Builder.Flags) > 0 {
 		args = append(args, b.cfg.Builder.Flags...)
 	}
 
+	// Adding output (-o) flag
+	outputPath, err := filepath.Abs(b.cfg.Builder.OutputPath)
+	if err != nil {
+		b.log.Error(
+			b.cfg.CurLocale["bld.err.abs"],
+			slog.String("error", err.Error()),
+		)
+		return err
+	}
 	if b.cfg.Builder.OutputPath != "" {
-		args = append(args, "-o", b.cfg.Builder.OutputPath)
+		args = append(args, "-o", outputPath)
 	}
 
+	// Adding target path flag
+	targetPath, err := filepath.Abs(b.cfg.Obfuscator.TargetPath)
+	if err != nil {
+		b.log.Error(
+			b.cfg.CurLocale["bld.err.abs"],
+			slog.String("error", err.Error()),
+		)
+		return err
+	}
 	if b.cfg.Obfuscator.TargetPath != "" {
-		args = append(args, b.cfg.Obfuscator.TargetPath)
+		args = append(args, targetPath)
 	}
 
 	cmd := exec.Command("go", args...)

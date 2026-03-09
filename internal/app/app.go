@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"gopkg.in/yaml.v3"
+	"log"
 	"log/slog"
 	"os"
 	"os/signal"
 	"pop-go/internal/builder"
+	"pop-go/internal/config"
 	"pop-go/internal/models"
 	"pop-go/internal/obfuscator"
 	"pop-go/pkg/fs"
@@ -20,6 +22,15 @@ func Run(cfg *models.Config) {
 	_, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Filling config by flags values
+	config.FillConfig()
+	return
+	//Validating config
+	if err := config.ValidateConfig(cfg); err != nil {
+		log.Fatal(err.Error())
+	}
+
+	// Loading locales from ./locales by "lang" from config
 	locale, err := loadLocales(cfg)
 	if err != nil {
 		fmt.Println(fmt.Sprintf("error loading locales: %v", err))
@@ -48,7 +59,7 @@ func Run(cfg *models.Config) {
 	log.Debug(cfg.CurLocale["app.debug.create.temp.dir"], slog.String("path", dir))
 
 	// Deleting temp dir if flag is set
-	if cfg.App.DeleteTempAfterBuild {
+	if cfg.App.RemoveTemp {
 		defer func(path string) {
 			err = os.RemoveAll(path)
 			if err != nil {
@@ -111,11 +122,11 @@ func loadLocales(cfg *models.Config) (*map[string]string, error) {
 func makeTempDir(cfg *models.Config) (string, error) {
 	var dir string
 	var err error
-	if cfg.App.TempFolder == "" {
+	if cfg.App.TempDir == "" {
 		dir, err = os.MkdirTemp("/tmp", "")
 	} else {
-		dir = cfg.App.TempFolder
-		err = os.MkdirAll("./"+cfg.App.TempFolder, 0700)
+		dir = cfg.App.TempDir
+		err = os.MkdirAll("./"+cfg.App.TempDir, 0700)
 	}
 
 	if err != nil {
