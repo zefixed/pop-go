@@ -17,20 +17,35 @@ type App struct {
 }
 
 type Log struct {
-	Level string `json:"level"`
-	Type  string `json:"type"`
-	File  string `json:"file"`
+	Level      string `json:"level"`
+	Type       string `json:"type"`
+	EnableFile bool   `json:"enable_file"`
+	File       string `json:"file"`
 }
 
 type Obfuscator struct {
-	TargetPath string   `json:"target_path"`
-	Comments   bool     `json:"comments"`
-	Seed       int64    `json:"seed"`
-	Literals   Literals `json:"literals"`
+	TargetPath  string      `json:"target_path"`
+	Seed        int64       `json:"seed"`
+	Comments    Comments    `json:"comments"`
+	Literals    Literals    `json:"literals"`
+	Identifiers Identifiers `json:"identifiers"`
+	ControlFlow ControlFlow `json:"control_flow"`
+}
+
+type Comments struct {
+	Enable bool `json:"enable"`
 }
 
 type Literals struct {
-	Level string `json:"level"`
+	Enable bool   `json:"enable"`
+	Level  string `json:"level"`
+}
+type Identifiers struct {
+	Enable bool `json:"enable"`
+}
+
+type ControlFlow struct {
+	Enable bool `json:"enable"`
 }
 
 type Builder struct {

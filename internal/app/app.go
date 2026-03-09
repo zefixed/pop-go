@@ -52,7 +52,7 @@ func Run(cfg *models.Config) {
 		defer func(path string) {
 			err = os.RemoveAll(path)
 			if err != nil {
-				log.Debug(cfg.CurLocale["app.debug.delete.temp.dir.err"], slog.String("path", path))
+				log.Debug(cfg.CurLocale["app.err.delete.temp.dir"], slog.String("path", path))
 			} else {
 				log.Debug(cfg.CurLocale["app.debug.delete.temp.dir"], slog.String("path", path))
 			}
@@ -86,7 +86,6 @@ func Run(cfg *models.Config) {
 	err = builder.NewBuilder(cfg, log).Build()
 	if err != nil {
 		stop()
-		log.Error(err.Error())
 		log.Error(cfg.CurLocale["app.err.shutdown"])
 		return
 	}
