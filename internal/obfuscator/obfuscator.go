@@ -6,6 +6,7 @@ import (
 	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"pop-go/internal/models"
+	"pop-go/internal/obfuscator/cff"
 	"pop-go/internal/obfuscator/literals"
 	"pop-go/internal/obfuscator/renameIdentifiers"
 )
@@ -16,6 +17,7 @@ type Obfuscator struct {
 	pkgs              []*packages.Package
 	literals          *literals.Literals
 	renameIdentifiers *renameIdentifiers.RenameIdentifiers
+	controlFlow       *cff.CFF
 	CritErr           error
 }
 
@@ -46,5 +48,6 @@ func NewObfuscator(cfg *models.Config, log *slog.Logger) *Obfuscator {
 		pkgs:              pkgs,
 		literals:          literals.NewLiterals(cfg, log, pkgs),
 		renameIdentifiers: renameIdentifiers.NewRenameIdentifiers(cfg, log, pkgs),
+		controlFlow:       cff.NewCFF(cfg, log, pkgs),
 	}
 }
