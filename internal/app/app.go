@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"gopkg.in/yaml.v3"
-	"log"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -17,17 +16,16 @@ import (
 	"syscall"
 )
 
-func Run(cfg *models.Config) {
+func Run() {
 	// Global context
 	_, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Filling config by flags values
-	config.FillConfig()
-	return
-	//Validating config
-	if err := config.ValidateConfig(cfg); err != nil {
-		log.Fatal(err.Error())
+	// Getting config structure by filling from flags values
+	cfg, err := config.GetConfig()
+	if err != nil {
+		fmt.Println(fmt.Sprintf("error getting config: %v", err))
+		return
 	}
 
 	// Loading locales from ./locales by "lang" from config

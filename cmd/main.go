@@ -1,20 +1,13 @@
 package main
 
 import (
-	"log"
 	"pop-go/internal/app"
-	"pop-go/internal/config"
 )
 
+// TODO:
+//   - Строковые литералы: сделать hard обфускацию
+//   - Control Flow Flattening
+//   - Вставка мертвого кода (сначала проверить не будет ли он удаляться компилятором)
 func main() {
-	cfg, err := config.NewConfig("config/config.json")
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-
-	if err = config.ValidateConfig(cfg); err != nil {
-		log.Fatal(err.Error())
-	}
-
-	app.Run(cfg)
+	app.Run()
 }
