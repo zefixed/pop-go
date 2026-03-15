@@ -1,7 +1,9 @@
 package main
 
 import (
-	"pop-go/internal/app"
+	"fmt"
+	"os"
+	"pop-go/internal/config"
 )
 
 // TODO:
@@ -9,5 +11,8 @@ import (
 //   - Control Flow Flattening
 //   - Вставка мертвого кода (сначала проверить не будет ли он удаляться компилятором)
 func main() {
-	app.Run()
+	if err := config.Execute(); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
 }

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"pop-go/internal/builder"
-	"pop-go/internal/config"
 	"pop-go/internal/models"
 	"pop-go/internal/obfuscator"
 	"pop-go/pkg/fs"
@@ -16,31 +15,24 @@ import (
 	"syscall"
 )
 
-func Run() {
+func Run(cfg *models.Config) error {
+	fmt.Println(fmt.Sprintf("%+v", cfg))
+
 	// Global context
 	_, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Getting config structure by filling from flags values
-	cfg, err := config.GetConfig()
-	if err != nil {
-		fmt.Println(fmt.Sprintf("error getting config: %v", err))
-		return
-	}
-
 	// Loading locales from ./locales by "lang" from config
 	locale, err := loadLocales(cfg)
 	if err != nil {
-		fmt.Println(fmt.Sprintf("error loading locales: %v", err))
-		return
+		return fmt.Errorf(fmt.Sprintf("error loading locales: %v", err))
 	}
 	cfg.CurLocale = *locale
 
 	// Logger setup
 	log, closer, err := pkglog.SetupLogger(cfg)
 	if err != nil {
-		fmt.Println(fmt.Sprintf("%s: %v", cfg.CurLocale["app.err.setup.logger"], err))
-		return
+		return fmt.Errorf(fmt.Sprintf("%s: %v", cfg.CurLocale["app.err.setup.logger"], err))
 	}
 	defer closer()
 
@@ -51,8 +43,7 @@ func Run() {
 	// Making temporary directory
 	dir, err := makeTempDir(cfg)
 	if err != nil {
-		log.Error(err.Error())
-		return
+		return err
 	}
 	log.Debug(cfg.CurLocale["app.debug.create.temp.dir"], slog.String("path", dir))
 
@@ -71,8 +62,7 @@ func Run() {
 	// Copying project to temp dir
 	err = fs.CopyDir(cfg.Obfuscator.TargetPath, dir)
 	if err != nil {
-		log.Error(fmt.Sprintf("%s: %s", cfg.CurLocale["app.err.copy.temp.dir"], err))
-		return
+		return fmt.Errorf(fmt.Sprintf("%s: %s", cfg.CurLocale["app.err.copy.temp.dir"], err))
 	}
 	cfg.Obfuscator.TargetPath = dir
 
@@ -81,26 +71,25 @@ func Run() {
 	if obf.CritErr != nil {
 		stop()
 		log.Error(obf.CritErr.Error())
-		log.Error(cfg.CurLocale["app.err.shutdown"])
-		return
+		return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
 	}
 	err = obf.Obfuscate()
 	if err != nil {
 		log.Error(err.Error())
-		log.Error(cfg.CurLocale["app.err.shutdown"])
-		return
+		return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
 	}
 
 	// Start of building
 	err = builder.NewBuilder(cfg, log).Build()
 	if err != nil {
 		stop()
-		log.Error(cfg.CurLocale["app.err.shutdown"])
-		return
+		return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
 	}
 
 	stop()
 	log.Info(cfg.CurLocale["app.info.shutdown"])
+
+	return nil
 }
 
 func loadLocales(cfg *models.Config) (*map[string]string, error) {
