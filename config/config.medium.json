@@ -1,0 +1,38 @@
+{
+  "app": {
+    "name": "pop-go",
+    "version": "0.0.1",
+    "lang": "en",
+    "temp_dir": "",
+    "remove_temp": true
+  },
+  "log": {
+    "level": "info",
+    "type": "text",
+    "enable_file": false,
+    "file": ".log"
+  },
+  "obfuscator": {
+    "target_path": "",
+    "seed": 0,
+    "comments": {
+      "enable": true
+    },
+    "control_flow": {
+      "enable": false
+    },
+    "identifiers": {
+      "enable": true
+    },
+    "literals": {
+      "enable": true,
+      "level": "medium"
+    }
+  },
+  "builder": {
+    "flags": ["-ldflags", "-s -w", "-trimpath"],
+    "goos": "windows",
+    "goarch": "amd64",
+    "output_path": "."
+  }
+}

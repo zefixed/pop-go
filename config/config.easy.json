@@ -2,31 +2,31 @@
   "app": {
     "name": "pop-go",
     "version": "0.0.1",
-    "lang": "ru",
+    "lang": "en",
     "temp_dir": "",
-    "remove_temp": false
+    "remove_temp": true
   },
   "log": {
-    "level": "debug",
+    "level": "info",
     "type": "text",
     "enable_file": false,
     "file": ".log"
   },
   "obfuscator": {
-    "target_path": "../FQW",
+    "target_path": "",
     "seed": 0,
     "comments": {
       "enable": true
     },
     "control_flow": {
-      "enable": true
+      "enable": false
     },
     "identifiers": {
       "enable": true
     },
     "literals": {
       "enable": true,
-      "level": "medium"
+      "level": "easy"
     }
   },
   "builder": {

@@ -16,17 +16,17 @@
     "target_path": "",
     "seed": 0,
     "comments": {
-      "enable": false
+      "enable": true
     },
     "control_flow": {
-      "enable": false
+      "enable": true
     },
     "identifiers": {
-      "enable": false
+      "enable": true
     },
     "literals": {
-      "enable": false,
-      "level": "easy"
+      "enable": true,
+      "level": "medium"
     }
   },
   "builder": {
