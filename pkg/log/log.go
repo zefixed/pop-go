@@ -10,29 +10,36 @@ import (
 )
 
 func SetupLogger(cfg *models.Config) (*slog.Logger, func() error, error) {
-	var log *slog.Logger
-	var err error
-
-	var handler slog.Handler
 	level := getLogLevel(strings.TrimSpace(cfg.Log.Level))
 
 	if level == nil {
 		return nil, nil, fmt.Errorf("%s: %v", cfg.CurLocale["log.err.invalid.level"], cfg.Log.Level)
 	}
 
-	file, err := os.OpenFile(cfg.Log.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%s: %w", cfg.CurLocale["log.err.open.file"], err)
-	}
+	var multiWriter io.Writer
+	var closer func() error
 
-	closer := func() error {
-		if err := file.Sync(); err != nil {
-			return err
+	if cfg.Log.EnableFile {
+		file, err := os.OpenFile(cfg.Log.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%s: %w", cfg.CurLocale["log.err.open.file"], err)
 		}
-		return file.Close()
+		closer = func() error {
+			if err := file.Sync(); err != nil {
+				return err
+			}
+			return file.Close()
+		}
+		multiWriter = io.MultiWriter(os.Stdout, file)
+	} else {
+		multiWriter = io.MultiWriter(os.Stdout)
+		closer = func() error {
+			return nil
+		}
 	}
 
-	multiWriter := io.MultiWriter(os.Stdout, file)
+	var log *slog.Logger
+	var handler slog.Handler
 
 	switch strings.TrimSpace(cfg.Log.Type) {
 	case "text":

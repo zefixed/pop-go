@@ -15,23 +15,24 @@ import (
 	"syscall"
 )
 
-func Run(cfg *models.Config) {
+func Run(cfg *models.Config) error {
+	fmt.Println(fmt.Sprintf("%+v", cfg))
+
 	// Global context
 	_, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Loading locales from ./locales by "lang" from config
 	locale, err := loadLocales(cfg)
 	if err != nil {
-		fmt.Println(fmt.Sprintf("error loading locales: %v", err))
-		return
+		return fmt.Errorf(fmt.Sprintf("error loading locales: %v", err))
 	}
 	cfg.CurLocale = *locale
 
 	// Logger setup
 	log, closer, err := pkglog.SetupLogger(cfg)
 	if err != nil {
-		fmt.Println(fmt.Sprintf("%s: %v", cfg.CurLocale["app.err.setup.logger"], err))
-		return
+		return fmt.Errorf(fmt.Sprintf("%s: %v", cfg.CurLocale["app.err.setup.logger"], err))
 	}
 	defer closer()
 
@@ -42,13 +43,12 @@ func Run(cfg *models.Config) {
 	// Making temporary directory
 	dir, err := makeTempDir(cfg)
 	if err != nil {
-		log.Error(err.Error())
-		return
+		return err
 	}
 	log.Debug(cfg.CurLocale["app.debug.create.temp.dir"], slog.String("path", dir))
 
 	// Deleting temp dir if flag is set
-	if cfg.App.DeleteTempAfterBuild {
+	if cfg.App.RemoveTemp {
 		defer func(path string) {
 			err = os.RemoveAll(path)
 			if err != nil {
@@ -62,8 +62,7 @@ func Run(cfg *models.Config) {
 	// Copying project to temp dir
 	err = fs.CopyDir(cfg.Obfuscator.TargetPath, dir)
 	if err != nil {
-		log.Error(fmt.Sprintf("%s: %s", cfg.CurLocale["app.err.copy.temp.dir"], err))
-		return
+		return fmt.Errorf(fmt.Sprintf("%s: %s", cfg.CurLocale["app.err.copy.temp.dir"], err))
 	}
 	cfg.Obfuscator.TargetPath = dir
 
@@ -72,26 +71,25 @@ func Run(cfg *models.Config) {
 	if obf.CritErr != nil {
 		stop()
 		log.Error(obf.CritErr.Error())
-		log.Error(cfg.CurLocale["app.err.shutdown"])
-		return
+		return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
 	}
 	err = obf.Obfuscate()
 	if err != nil {
 		log.Error(err.Error())
-		log.Error(cfg.CurLocale["app.err.shutdown"])
-		return
+		return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
 	}
 
 	// Start of building
 	err = builder.NewBuilder(cfg, log).Build()
 	if err != nil {
 		stop()
-		log.Error(cfg.CurLocale["app.err.shutdown"])
-		return
+		return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
 	}
 
 	stop()
 	log.Info(cfg.CurLocale["app.info.shutdown"])
+
+	return nil
 }
 
 func loadLocales(cfg *models.Config) (*map[string]string, error) {
@@ -111,11 +109,11 @@ func loadLocales(cfg *models.Config) (*map[string]string, error) {
 func makeTempDir(cfg *models.Config) (string, error) {
 	var dir string
 	var err error
-	if cfg.App.TempFolder == "" {
+	if cfg.App.TempDir == "" {
 		dir, err = os.MkdirTemp("/tmp", "")
 	} else {
-		dir = cfg.App.TempFolder
-		err = os.MkdirAll("./"+cfg.App.TempFolder, 0700)
+		dir = cfg.App.TempDir
+		err = os.MkdirAll("./"+cfg.App.TempDir, 0700)
 	}
 
 	if err != nil {
