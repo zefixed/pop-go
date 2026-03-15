@@ -7,9 +7,10 @@ import (
 )
 
 type CFF struct {
-	cfg  *models.Config
-	log  *slog.Logger
-	pkgs []*packages.Package
+	cfg         *models.Config
+	log         *slog.Logger
+	pkgs        []*packages.Package
+	hoistedVars map[string]bool // Track hoisted variables per function
 }
 
 func NewCFF(cfg *models.Config, log *slog.Logger, pkgs []*packages.Package) *CFF {

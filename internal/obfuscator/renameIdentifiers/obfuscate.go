@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"go/types"
 	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"pop-go/pkg/util"
 	"strings"
@@ -31,12 +32,14 @@ func (i *RenameIdentifiers) Obfuscate() error {
 			continue
 		}
 
+		// Build package-level rename map for consistent renaming across all files
+		renameMap := i.buildRenameMap(pkg, pkg.PkgPath)
+
 		for _, file := range pkg.Syntax {
 			absPath := pkg.Fset.File(file.Pos()).Name()
 			i.log.Debug(i.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", absPath))
 
-			// Modifying the AST
-			if err := i.obfuscateAST(file, pkg.TypesInfo, pkg.PkgPath); err != nil {
+			if err := i.applyRenameMap(file, pkg.TypesInfo, renameMap); err != nil {
 				return fmt.Errorf(i.cfg.CurLocale["obf.err.ren.ids"], absPath, err)
 			}
 		}
@@ -46,68 +49,95 @@ func (i *RenameIdentifiers) Obfuscate() error {
 	return nil
 }
 
-func (i *RenameIdentifiers) obfuscateAST(f *ast.File, typesInfo *types.Info, currentPkgPath string) error {
-	renameMap := make(map[string]string)
-	processed := make(map[token.Pos]bool)
+func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath string) map[types.Object]string {
+	renameMap := make(map[types.Object]string)
+	importedNames := i.collectImportedNames(pkg.Syntax)
 
-	// Collecting all the names of the imported packages
-	importedNames := make(map[string]bool)
-	for _, imp := range f.Imports {
-		if imp.Name != nil {
-			if imp.Name.Name != "_" && imp.Name.Name != "." {
-				importedNames[imp.Name.Name] = true
+	for _, file := range pkg.Syntax {
+		// Collect type switch variables to exclude them from renaming
+		typeSwitchVars := collectTypeSwitchVars(file)
+
+		processed := make(map[token.Pos]bool)
+		ast.Inspect(file, func(n ast.Node) bool {
+			ident, ok := n.(*ast.Ident)
+			if !ok || ident == nil || processed[ident.Pos()] {
+				return true
 			}
-		} else {
-			path := strings.Trim(imp.Path.Value, `"`)
-			parts := strings.Split(path, "/")
-			importedNames[parts[len(parts)-1]] = true
-		}
+			processed[ident.Pos()] = true
+
+			// Skip type switch variables - they have special scoping and type behavior
+			if typeSwitchVars[ident.Pos()] {
+				return true
+			}
+
+			if !shouldRename(ident, file, pkg.TypesInfo, currentPkgPath, importedNames) {
+				return true
+			}
+
+			obj := pkg.TypesInfo.ObjectOf(ident)
+			if obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == currentPkgPath {
+				if _, exists := renameMap[obj]; !exists {
+					renameMap[obj] = util.GenerateUniqueName(i.cfg.Obfuscator.Seed)
+				}
+			}
+
+			return true
+		})
 	}
 
-	// Collect all the positions of the identifiers in SelectorExpr.X (for example, pkg in pkg.Func)
-	selectorPositions := make(map[token.Pos]bool)
-	ast.Inspect(f, func(n ast.Node) bool {
-		if sel, ok := n.(*ast.SelectorExpr); ok {
-			if ident, ok := sel.X.(*ast.Ident); ok {
-				selectorPositions[ident.Pos()] = true
+	return renameMap
+}
+
+// collectTypeSwitchVars collects all positions of type switch variables
+// including the declaration and all uses within case clauses
+func collectTypeSwitchVars(file *ast.File) map[token.Pos]bool {
+	vars := make(map[token.Pos]bool)
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		ts, ok := n.(*ast.TypeSwitchStmt)
+		if !ok || ts.Assign == nil {
+			return true
+		}
+
+		// Get the type switch variable from the assignment
+		var typeSwitchVar *ast.Ident
+		if assign, ok := ts.Assign.(*ast.AssignStmt); ok && len(assign.Lhs) > 0 {
+			if ident, ok := assign.Lhs[0].(*ast.Ident); ok {
+				typeSwitchVar = ident
+				vars[ident.Pos()] = true
 			}
 		}
-		return true
-	})
 
-	// First pass: collecting identifiers for renaming
-	ast.Inspect(f, func(n ast.Node) bool {
-		ident, ok := n.(*ast.Ident)
-		if !ok || ident == nil || processed[ident.Pos()] {
-			return true
-		}
-		processed[ident.Pos()] = true
-
-		if !shouldRename(ident, f, typesInfo, currentPkgPath, importedNames, selectorPositions) {
+		if typeSwitchVar == nil {
 			return true
 		}
 
-		name := ident.Name
-		if _, exists := renameMap[name]; !exists {
-			renameMap[name] = util.GenerateUniqueName(i.cfg.Obfuscator.Seed)
-		}
+		// Collect all uses of this variable within the type switch body
+		ast.Inspect(ts.Body, func(inner ast.Node) bool {
+			if ident, ok := inner.(*ast.Ident); ok && ident.Name == typeSwitchVar.Name {
+				vars[ident.Pos()] = true
+			}
+			return true
+		})
 
 		return true
 	})
 
-	// Second pass: replacing IDs
+	return vars
+}
+
+func (i *RenameIdentifiers) applyRenameMap(f *ast.File, typesInfo *types.Info, renameMap map[types.Object]string) error {
 	astutil.Apply(f, nil, func(cursor *astutil.Cursor) bool {
 		ident, ok := cursor.Node().(*ast.Ident)
 		if !ok || ident == nil {
 			return true
 		}
 
-		if !shouldRename(ident, f, typesInfo, currentPkgPath, importedNames, selectorPositions) {
-			return true
-		}
-
-		if newName, exists := renameMap[ident.Name]; exists {
-			ident.Name = newName
+		obj := typesInfo.ObjectOf(ident)
+		if obj != nil {
+			if newName, exists := renameMap[obj]; exists {
+				ident.Name = newName
+			}
 		}
 
 		return true
@@ -116,78 +146,65 @@ func (i *RenameIdentifiers) obfuscateAST(f *ast.File, typesInfo *types.Info, cur
 	return nil
 }
 
-func shouldRename(ident *ast.Ident, file *ast.File, typesInfo *types.Info, currentPkgPath string, importedNames map[string]bool, selectorPositions map[token.Pos]bool) bool {
+func (i *RenameIdentifiers) collectImportedNames(files []*ast.File) map[string]bool {
+	importedNames := make(map[string]bool)
+	for _, f := range files {
+		for _, imp := range f.Imports {
+			if imp.Name != nil {
+				if imp.Name.Name != "_" && imp.Name.Name != "." {
+					importedNames[imp.Name.Name] = true
+				}
+			} else {
+				path := strings.Trim(imp.Path.Value, `"`)
+				parts := strings.Split(path, "/")
+				importedNames[parts[len(parts)-1]] = true
+			}
+		}
+	}
+	return importedNames
+}
+
+func shouldRename(ident *ast.Ident, file *ast.File, typesInfo *types.Info, currentPkgPath string, importedNames map[string]bool) bool {
 	name := ident.Name
-	// Fast path: Check conditions that don't require external data first
-	// Skip exported identifiers early as they are common and easy to check
 	if ast.IsExported(name) {
 		return false
 	}
 
-	// Skip special identifiers like blank identifier, init, main
 	if name == "_" || name == "init" || name == "main" {
 		return false
 	}
 
-	// Skip built-in types and functions early before accessing complex data structures
 	if isBuiltinType(name) {
 		return false
 	}
 
-	// Skip the package name in the file declaration if this identifier matches it
 	if file.Name != nil && file.Name.Pos() == ident.Pos() {
 		return false
 	}
 
-	// Handle identifiers that appear on the left side of selectors (e.g., pkg.Func)
-	// These are likely package names and should not be renamed
-	if selectorPositions[ident.Pos()] {
-		// Check against known imported names in this file
-		if importedNames[name] {
-			return false
-		}
-		// Check against standard library package names
-		if standardPackageNames[name] {
-			return false
-		}
-		// Use type information to confirm if this is a package name
-		if typesInfo != nil {
-			if obj := typesInfo.ObjectOf(ident); obj != nil {
-				if _, ok := obj.(*types.PkgName); ok {
-					return false
-				}
-			}
-		}
-	}
-
-	// Perform additional checks only if type information is available
 	if typesInfo != nil {
 		obj := typesInfo.ObjectOf(ident)
 		if obj == nil {
-			// If no object information is available, we cannot make a decision based on types,
-			// so proceed with renaming unless already excluded above
 			return true
 		}
 
-		// Skip embedded fields or unqualified identifiers that have no associated package
-		if obj.Pkg() == nil {
-			return false
-		}
-
-		// Avoid renaming package names identified through type information
-		// This check was duplicated earlier; now consolidated here
 		if _, ok := obj.(*types.PkgName); ok {
 			return false
 		}
 
-		// Skip identifiers originating from standard library packages
-		// Compare package paths to determine origin
+		if obj.Pkg() == nil {
+			return false
+		}
+
+		if obj.Pkg().Path() != currentPkgPath {
+			return false
+		}
+
 		if isStandardPackagePath(obj.Pkg().Path(), currentPkgPath) {
 			return false
 		}
 	}
 
-	// If all checks pass, this identifier can be safely renamed
 	return true
 }
 

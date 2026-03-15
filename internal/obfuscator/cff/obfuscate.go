@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"go/types"
+	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"pop-go/pkg/util"
 	"time"
@@ -15,39 +17,37 @@ import (
 func (f *CFF) Obfuscate() {
 	f.log.Info(f.cfg.CurLocale["obf.info.start.cff"])
 	t := time.Now()
-
 	for _, pkg := range f.pkgs {
 		for _, file := range pkg.Syntax {
 			absPath := pkg.Fset.File(file.Pos()).Name()
 			f.log.Debug(f.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", absPath))
-
-			if err := f.flattenFile(file, pkg.Fset); err != nil {
+			if err := f.flattenFile(file, pkg); err != nil {
 				f.log.Error(f.cfg.CurLocale["obf.err.cff"], slog.String("file", absPath), slog.Any("error", err))
 				continue
 			}
 		}
 	}
-
 	f.log.Info(f.cfg.CurLocale["obf.info.end.cff"], slog.String("duration", time.Since(t).String()))
 }
 
 // flattenFile processes a Go AST file and applies control flow flattening
 // to eligible functions. Functions containing concurrency primitives (goroutines,
 // channels) are skipped to avoid synchronization issues.
-func (f *CFF) flattenFile(file *ast.File, fset *token.FileSet) error {
+func (f *CFF) flattenFile(file *ast.File, pkg *packages.Package) error {
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Body == nil || len(fn.Body.List) < 2 {
 			continue
 		}
-
-		// Skip functions with concurrency primitives to prevent deadlocks
 		if f.hasConcurrency(fn.Body.List) {
 			f.log.Debug("skipping function with concurrency", slog.String("function", fn.Name.Name))
 			continue
 		}
-
-		if err := f.flattenFunction(fn); err != nil {
+		if f.hasAnonymousStructTypeAssertion(fn.Body.List) {
+			f.log.Debug("skipping function with anonymous struct type assertion", slog.String("function", fn.Name.Name))
+			continue
+		}
+		if err := f.flattenFunction(fn, pkg); err != nil {
 			return err
 		}
 	}
@@ -146,145 +146,151 @@ type VarInfo struct {
 // converted into switch cases controlled by a state variable within a
 // for-loop dispatcher. Variable declarations are hoisted to function scope
 // to maintain visibility across case boundaries.
-func (f *CFF) flattenFunction(fn *ast.FuncDecl) error {
+func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package) error {
+	hoistedVars := make(map[string]bool)
 	stateVarName := util.GenerateUniqueName(f.cfg.Obfuscator.Seed)
 	originalStmts := fn.Body.List
+	typesInfo := pkg.TypesInfo
+	currentPkgName := pkg.Name // Get current package name
 
-	// Phase 1: Collect variables with type information for hoisting
 	varInfoMap := make(map[string]*VarInfo)
 
-	// Register function parameters with their types (marked as IsParam=true)
 	if fn.Type.Params != nil {
 		for _, param := range fn.Type.Params.List {
 			for _, name := range param.Names {
-				varInfoMap[name.Name] = &VarInfo{
-					Name:    name.Name,
-					Type:    param.Type,
-					IsParam: true,
-				}
+				varInfoMap[name.Name] = &VarInfo{Name: name.Name, Type: param.Type, IsParam: true}
 			}
 		}
 	}
 
-	// First pass: collect variables from short declarations (:=) and explicit var statements
 	for _, stmt := range originalStmts {
-		f.collectVarsWithTypes(stmt, varInfoMap)
+		f.collectVarsWithTypes(stmt, varInfoMap, typesInfo, currentPkgName)
+	}
+	for _, stmt := range originalStmts {
+		f.resolveVarTypes(stmt, varInfoMap, typesInfo, currentPkgName)
 	}
 
-	// Second pass: refine variable types using already collected information
-	for _, stmt := range originalStmts {
-		f.resolveVarTypes(stmt, varInfoMap)
-	}
-
-	// Phase 2: Generate hoisted variable declarations (excluding parameters)
 	var hoistedDecls []ast.Stmt
-	for _, varInfo := range varInfoMap {
-		if varInfo.IsParam {
+	for _, v := range varInfoMap {
+		if v.IsParam {
 			continue
 		}
-
-		varDecl := &ast.DeclStmt{
+		hoistedVars[v.Name] = true
+		hoistedDecls = append(hoistedDecls, &ast.DeclStmt{
 			Decl: &ast.GenDecl{
 				Tok: token.VAR,
 				Specs: []ast.Spec{
-					&ast.ValueSpec{
-						Names: []*ast.Ident{{Name: varInfo.Name}},
-						Type:  varInfo.Type,
-					},
+					&ast.ValueSpec{Names: []*ast.Ident{{Name: v.Name}}, Type: v.Type},
 				},
 			},
-		}
-		hoistedDecls = append(hoistedDecls, varDecl)
+		})
 	}
 
-	// Phase 3: Build the state machine dispatcher (switch inside for-loop)
-	var caseClauses []ast.Stmt
+	var cases []ast.Stmt
 	n := len(originalStmts)
-
 	for i, stmt := range originalStmts {
-		// Convert short declarations (:=) to assignments (=) for hoisted variables
-		processedStmt := f.convertDefineToAssign(stmt)
-
-		// Determine transition: either next state or break for final statement
-		var transition ast.Stmt
+		processed := f.convertDefineToAssign(stmt, hoistedVars)
+		var trans ast.Stmt
 		if i == n-1 {
-			transition = &ast.BranchStmt{Tok: token.BREAK}
+			trans = &ast.BranchStmt{Tok: token.BREAK}
 		} else {
-			transition = &ast.AssignStmt{
+			trans = &ast.AssignStmt{
 				Tok: token.ASSIGN,
 				Lhs: []ast.Expr{&ast.Ident{Name: stateVarName}},
 				Rhs: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("%d", i+1)}},
 			}
 		}
-
-		// Assemble case body: processed statement + state transition
-		caseBody := []ast.Stmt{processedStmt, transition}
-
-		caseBlock := &ast.BlockStmt{
-			List: caseBody,
-		}
-
-		caseClause := &ast.CaseClause{
+		cases = append(cases, &ast.CaseClause{
 			List: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("%d", i)}},
-			Body: []ast.Stmt{caseBlock},
-		}
-		caseClauses = append(caseClauses, caseClause)
+			Body: []ast.Stmt{&ast.BlockStmt{List: []ast.Stmt{processed, trans}}},
+		})
 	}
+	cases = append(cases, &ast.CaseClause{Body: []ast.Stmt{&ast.BranchStmt{Tok: token.BREAK}}})
 
-	// Add default case as safety fallback to exit the dispatcher loop
-	defaultCase := &ast.CaseClause{
-		Body: []ast.Stmt{&ast.BranchStmt{Tok: token.BREAK}},
-	}
-	caseClauses = append(caseClauses, defaultCase)
-
-	// Phase 4: Assemble the new function body
-	finalBody := []ast.Stmt{}
-	finalBody = append(finalBody, hoistedDecls...)
-
-	// Initialize state variable: state := 0
-	stateInit := &ast.AssignStmt{
+	finalBody := append(hoistedDecls, &ast.AssignStmt{
 		Tok: token.DEFINE,
 		Lhs: []ast.Expr{&ast.Ident{Name: stateVarName}},
 		Rhs: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: "0"}},
-	}
-	finalBody = append(finalBody, stateInit)
-
-	// Create the dispatcher: for { switch state { ... } }
-	dispatcherLoop := &ast.ForStmt{
-		Body: &ast.BlockStmt{
-			List: []ast.Stmt{
-				&ast.SwitchStmt{
-					Tag: &ast.Ident{Name: stateVarName},
-					Body: &ast.BlockStmt{
-						List: caseClauses,
-					},
-				},
-			},
-		},
-	}
-	finalBody = append(finalBody, dispatcherLoop)
-
-	// Replace the original function body with the flattened version
+	})
+	finalBody = append(finalBody, &ast.ForStmt{
+		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.SwitchStmt{
+			Tag:  &ast.Ident{Name: stateVarName},
+			Body: &ast.BlockStmt{List: cases},
+		}}},
+	})
 	fn.Body.List = finalBody
-
 	return nil
 }
 
 // collectVarsWithTypes recursively traverses statements to collect variables
 // declared with short declaration syntax (:=). Infers types from RHS expressions
 // and stores them in varMap for later hoisting. Handles nested blocks, if/for/range.
-func (f *CFF) collectVarsWithTypes(stmt ast.Stmt, varMap map[string]*VarInfo) {
+func (f *CFF) collectVarsWithTypes(stmt ast.Stmt, varMap map[string]*VarInfo, typesInfo *types.Info, currentPkgName string) {
 	switch s := stmt.(type) {
 	case *ast.AssignStmt:
 		if s.Tok == token.DEFINE {
 			for i, lhs := range s.Lhs {
 				if ident, ok := lhs.(*ast.Ident); ok {
 					if _, exists := varMap[ident.Name]; !exists {
-						varType := f.inferTypeFromExpr(s.Rhs[i], varMap)
-						varMap[ident.Name] = &VarInfo{
-							Name:    ident.Name,
-							Type:    varType,
-							IsParam: false,
+						var varType ast.Expr
+
+						// Check if RHS is a type assertion: x, ok := expr.(T)
+						if i < len(s.Rhs) {
+							if ta, ok := s.Rhs[i].(*ast.TypeAssertExpr); ok && ta.Type != nil {
+								if i == 0 {
+									// First variable gets the asserted type
+									varType = ta.Type // Use AST type directly
+								} else {
+									// Second variable (ok) is always bool
+									varType = &ast.Ident{Name: "bool"}
+								}
+								varMap[ident.Name] = &VarInfo{Name: ident.Name, Type: varType, IsParam: false}
+								continue
+							}
+						}
+
+						// For multi-value function returns, use types.Info to get correct types per index
+						if len(s.Lhs) > 1 && len(s.Rhs) == 1 && typesInfo != nil {
+							if tv, ok := typesInfo.Types[s.Rhs[0]]; ok && tv.Type != nil {
+								if tuple, ok := tv.Type.(*types.Tuple); ok && tuple.Len() == len(s.Lhs) {
+									// Each LHS variable gets its corresponding tuple element type
+									varType = f.typeToAST(tuple.At(i).Type(), currentPkgName)
+									varMap[ident.Name] = &VarInfo{Name: ident.Name, Type: varType, IsParam: false}
+									continue
+								}
+							}
+						}
+
+						// Fallback: infer type from the corresponding RHS expression
+						rhsIdx := i
+						if rhsIdx >= len(s.Rhs) {
+							rhsIdx = len(s.Rhs) - 1
+						}
+						if rhsIdx < 0 {
+							continue
+						}
+						varType = f.inferTypeFromExpr(s.Rhs[rhsIdx], varMap, typesInfo, currentPkgName)
+						varMap[ident.Name] = &VarInfo{Name: ident.Name, Type: varType, IsParam: false}
+					}
+				}
+			}
+		}
+	case *ast.DeclStmt:
+		if gen, ok := s.Decl.(*ast.GenDecl); ok && gen.Tok == token.VAR {
+			for _, spec := range gen.Specs {
+				if valueSpec, ok := spec.(*ast.ValueSpec); ok {
+					for _, name := range valueSpec.Names {
+						if _, exists := varMap[name.Name]; !exists {
+							varType := valueSpec.Type
+							if varType == nil && len(valueSpec.Values) > 0 && typesInfo != nil {
+								if tv, ok := typesInfo.Types[valueSpec.Values[0]]; ok && tv.Type != nil {
+									varType = f.typeToAST(tv.Type, currentPkgName)
+								}
+							}
+							if varType == nil {
+								varType = &ast.Ident{Name: "interface{}"}
+							}
+							varMap[name.Name] = &VarInfo{Name: name.Name, Type: varType, IsParam: false}
 						}
 					}
 				}
@@ -292,61 +298,76 @@ func (f *CFF) collectVarsWithTypes(stmt ast.Stmt, varMap map[string]*VarInfo) {
 		}
 	case *ast.BlockStmt:
 		for _, inner := range s.List {
-			f.collectVarsWithTypes(inner, varMap)
+			f.collectVarsWithTypes(inner, varMap, typesInfo, currentPkgName)
 		}
 	case *ast.IfStmt:
 		if s.Init != nil {
-			f.collectVarsWithTypes(s.Init, varMap)
+			f.collectVarsWithTypes(s.Init, varMap, typesInfo, currentPkgName)
 		}
-		f.collectVarsWithTypes(s.Body, varMap)
+		f.collectVarsWithTypes(s.Body, varMap, typesInfo, currentPkgName)
 		if s.Else != nil {
 			if elseBlock, ok := s.Else.(*ast.BlockStmt); ok {
-				f.collectVarsWithTypes(elseBlock, varMap)
+				f.collectVarsWithTypes(elseBlock, varMap, typesInfo, currentPkgName)
 			}
 		}
 	case *ast.ForStmt:
 		if s.Init != nil {
-			f.collectVarsWithTypes(s.Init, varMap)
+			if assign, ok := s.Init.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE {
+			} else {
+				f.collectVarsWithTypes(s.Init, varMap, typesInfo, currentPkgName)
+			}
 		}
-		f.collectVarsWithTypes(s.Body, varMap)
+		f.collectVarsWithTypes(s.Body, varMap, typesInfo, currentPkgName)
 	case *ast.RangeStmt:
-		if s.Key != nil {
-			if ident, ok := s.Key.(*ast.Ident); ok && s.Tok == token.DEFINE {
-				if _, exists := varMap[ident.Name]; !exists {
-					varMap[ident.Name] = &VarInfo{
-						Name:    ident.Name,
-						Type:    f.inferTypeFromRangeKey(s.X, varMap),
-						IsParam: false,
-					}
-				}
+		if s.Body != nil {
+			for _, inner := range s.Body.List {
+				f.collectVarsWithTypes(inner, varMap, typesInfo, currentPkgName)
 			}
 		}
-		if s.Value != nil {
-			if ident, ok := s.Value.(*ast.Ident); ok && s.Tok == token.DEFINE {
-				if _, exists := varMap[ident.Name]; !exists {
-					varMap[ident.Name] = &VarInfo{
-						Name:    ident.Name,
-						Type:    f.inferTypeFromRangeValue(s.X, varMap),
-						IsParam: false,
-					}
-				}
-			}
-		}
-		f.collectVarsWithTypes(s.Body, varMap)
 	}
 }
 
 // resolveVarTypes performs a second pass to refine variable types using
 // already collected information from varMap. This handles cases where
 // a variable's type depends on another variable declared earlier.
-func (f *CFF) resolveVarTypes(stmt ast.Stmt, varMap map[string]*VarInfo) {
+func (f *CFF) resolveVarTypes(stmt ast.Stmt, varMap map[string]*VarInfo, typesInfo *types.Info, currentPkgName string) {
 	switch s := stmt.(type) {
 	case *ast.AssignStmt:
 		if s.Tok == token.DEFINE {
 			for i, lhs := range s.Lhs {
 				if ident, ok := lhs.(*ast.Ident); ok {
 					if info, exists := varMap[ident.Name]; exists {
-						newType := f.inferTypeFromExpr(s.Rhs[i], varMap)
+						// Check if RHS is a type assertion: x, ok := expr.(T)
+						if i < len(s.Rhs) {
+							if ta, ok := s.Rhs[i].(*ast.TypeAssertExpr); ok && ta.Type != nil {
+								if i == 0 {
+									info.Type = ta.Type
+								} else {
+									info.Type = &ast.Ident{Name: "bool"}
+								}
+								continue
+							}
+						}
+
+						// For multi-value function returns, use types.Info to get correct types per index
+						if len(s.Lhs) > 1 && len(s.Rhs) == 1 && typesInfo != nil {
+							if tv, ok := typesInfo.Types[s.Rhs[0]]; ok && tv.Type != nil {
+								if tuple, ok := tv.Type.(*types.Tuple); ok && tuple.Len() == len(s.Lhs) {
+									info.Type = f.typeToAST(tuple.At(i).Type(), currentPkgName)
+									continue
+								}
+							}
+						}
+
+						// Fallback: infer type from the corresponding RHS expression
+						rhsIdx := i
+						if rhsIdx >= len(s.Rhs) {
+							rhsIdx = len(s.Rhs) - 1
+						}
+						if rhsIdx < 0 {
+							continue
+						}
+						newType := f.inferTypeFromExpr(s.Rhs[rhsIdx], varMap, typesInfo, currentPkgName)
 						info.Type = newType
 					}
 				}
@@ -354,31 +375,36 @@ func (f *CFF) resolveVarTypes(stmt ast.Stmt, varMap map[string]*VarInfo) {
 		}
 	case *ast.BlockStmt:
 		for _, inner := range s.List {
-			f.resolveVarTypes(inner, varMap)
+			f.resolveVarTypes(inner, varMap, typesInfo, currentPkgName)
 		}
 	case *ast.IfStmt:
 		if s.Init != nil {
-			f.resolveVarTypes(s.Init, varMap)
+			f.resolveVarTypes(s.Init, varMap, typesInfo, currentPkgName)
 		}
-		f.resolveVarTypes(s.Body, varMap)
+		f.resolveVarTypes(s.Body, varMap, typesInfo, currentPkgName)
 		if s.Else != nil {
 			if elseBlock, ok := s.Else.(*ast.BlockStmt); ok {
-				f.resolveVarTypes(elseBlock, varMap)
+				f.resolveVarTypes(elseBlock, varMap, typesInfo, currentPkgName)
 			}
 		}
 	case *ast.ForStmt:
 		if s.Init != nil {
-			f.resolveVarTypes(s.Init, varMap)
+			f.resolveVarTypes(s.Init, varMap, typesInfo, currentPkgName)
 		}
-		f.resolveVarTypes(s.Body, varMap)
+		f.resolveVarTypes(s.Body, varMap, typesInfo, currentPkgName)
 	}
 }
 
-// inferTypeFromExpr infers the Go type of an expression by pattern matching
+// inferTypeFromExpr infers the Go type of expression by pattern matching
 // on AST node types. Handles literals, identifiers (with varMap lookup),
 // function calls (make, chan), channel operations, and composite types.
 // Returns interface{} as fallback for unknown types.
-func (f *CFF) inferTypeFromExpr(expr ast.Expr, varMap map[string]*VarInfo) ast.Expr {
+func (f *CFF) inferTypeFromExpr(expr ast.Expr, varMap map[string]*VarInfo, typesInfo *types.Info, currentPkgName string) ast.Expr {
+	if typesInfo != nil {
+		if tv, ok := typesInfo.Types[expr]; ok && tv.Type != nil {
+			return f.typeToAST(tv.Type, currentPkgName)
+		}
+	}
 	switch e := expr.(type) {
 	case *ast.BasicLit:
 		switch e.Kind {
@@ -392,50 +418,32 @@ func (f *CFF) inferTypeFromExpr(expr ast.Expr, varMap map[string]*VarInfo) ast.E
 			return &ast.Ident{Name: "byte"}
 		}
 	case *ast.Ident:
-		// Lookup type from collected variable information
 		if info, exists := varMap[e.Name]; exists {
 			return info.Type
 		}
 		return &ast.Ident{Name: "string"}
 	case *ast.CallExpr:
-		if ident, ok := e.Fun.(*ast.Ident); ok {
-			switch ident.Name {
-			case "make":
-				// Handle make(chan T) -> chan T
-				if len(e.Args) > 0 {
-					argType := f.inferTypeFromExpr(e.Args[0], varMap)
-					if chanType, ok := argType.(*ast.ChanType); ok {
-						return chanType
-					}
-					return &ast.ChanType{Value: argType}
-				}
-			case "chan":
-				if len(e.Args) > 0 {
-					return &ast.ChanType{Value: f.inferTypeFromExpr(e.Args[0], varMap)}
-				}
+		if typesInfo != nil {
+			if tv, ok := typesInfo.Types[e]; ok && tv.Type != nil {
+				return f.typeToAST(tv.Type, currentPkgName)
 			}
 		}
-		return &ast.Ident{Name: "string"}
+		return &ast.Ident{Name: "interface{}"}
 	case *ast.UnaryExpr:
-		// Handle address-of: &Struct{} -> *Struct
 		if e.Op == token.AND {
 			if comp, ok := e.X.(*ast.CompositeLit); ok {
 				return &ast.StarExpr{X: comp.Type}
 			}
 		}
-		// Handle receive: <-ch -> element type of channel
 		if e.Op == token.ARROW {
-			chanType := f.inferTypeFromExpr(e.X, varMap)
+			chanType := f.inferTypeFromExpr(e.X, varMap, typesInfo, currentPkgName)
 			if ct, ok := chanType.(*ast.ChanType); ok {
 				return ct.Value
 			}
 		}
 	case *ast.CompositeLit:
 		return e.Type
-	case *ast.BinaryExpr:
-		return f.inferTypeFromExpr(e.X, varMap)
 	case *ast.ArrayType:
-		// ArrayType with Len==nil represents a slice
 		if e.Len == nil {
 			return &ast.ArrayType{Len: nil, Elt: e.Elt}
 		}
@@ -448,7 +456,7 @@ func (f *CFF) inferTypeFromExpr(expr ast.Expr, varMap map[string]*VarInfo) ast.E
 	return &ast.Ident{Name: "interface{}"}
 }
 
-// inferTypeFromRangeKey infers the type of a range loop's key variable.
+// inferTypeFromRangeKey infers the type of range loop's key variable.
 // For slices/arrays/maps, the key is typically int (index).
 func (f *CFF) inferTypeFromRangeKey(expr ast.Expr, varMap map[string]*VarInfo) ast.Expr {
 	switch expr.(type) {
@@ -460,7 +468,7 @@ func (f *CFF) inferTypeFromRangeKey(expr ast.Expr, varMap map[string]*VarInfo) a
 	return &ast.Ident{Name: "interface{}"}
 }
 
-// inferTypeFromRangeValue infers the type of a range loop's value variable.
+// inferTypeFromRangeValue infers the type of range loop's value variable.
 // Looks up the container type in varMap and extracts the element type.
 func (f *CFF) inferTypeFromRangeValue(expr ast.Expr, varMap map[string]*VarInfo) ast.Expr {
 	switch e := expr.(type) {
@@ -491,47 +499,184 @@ func (f *CFF) getElementType(expr ast.Expr) ast.Expr {
 // (:=) to assignments (=) in preparation for hoisting. This ensures
 // variables declared in one case remain accessible in subsequent cases.
 // Handles nested blocks, if/for/range statements recursively.
-func (f *CFF) convertDefineToAssign(stmt ast.Stmt) ast.Stmt {
+func (f *CFF) convertDefineToAssign(stmt ast.Stmt, hoistedVars map[string]bool) ast.Stmt {
+	isAnonymousStructAssertion := func(expr ast.Expr) bool {
+		if ta, ok := expr.(*ast.TypeAssertExpr); ok && ta.Type != nil {
+			_, isStruct := ta.Type.(*ast.StructType)
+			return isStruct
+		}
+		return false
+	}
+
 	switch s := stmt.(type) {
+	case *ast.DeclStmt:
+		if gen, ok := s.Decl.(*ast.GenDecl); ok && gen.Tok == token.VAR {
+			var assigns []ast.Stmt
+			for _, spec := range gen.Specs {
+				if vs, ok := spec.(*ast.ValueSpec); ok {
+					skip := true
+					for _, name := range vs.Names {
+						if !hoistedVars[name.Name] {
+							skip = false
+							break
+						}
+					}
+					if skip {
+						continue
+					}
+					if len(vs.Values) > 0 {
+						assigns = append(assigns, &ast.AssignStmt{
+							Lhs: toExprs(vs.Names), Tok: token.ASSIGN, TokPos: gen.TokPos, Rhs: vs.Values,
+						})
+					}
+				}
+			}
+			if len(assigns) == 1 {
+				return assigns[0]
+			}
+			if len(assigns) > 1 {
+				return &ast.BlockStmt{List: assigns}
+			}
+			return &ast.EmptyStmt{}
+		}
 	case *ast.AssignStmt:
 		if s.Tok == token.DEFINE {
-			newStmt := &ast.AssignStmt{
-				Lhs:    s.Lhs,
-				Tok:    token.ASSIGN,
-				TokPos: s.TokPos,
-				Rhs:    s.Rhs,
+			// Preserve := for type assertions to anonymous structs
+			for _, rhs := range s.Rhs {
+				if isAnonymousStructAssertion(rhs) {
+					return stmt
+				}
 			}
-			return newStmt
+			return &ast.AssignStmt{Lhs: s.Lhs, Tok: token.ASSIGN, TokPos: s.TokPos, Rhs: s.Rhs}
 		}
 	case *ast.BlockStmt:
-		newList := make([]ast.Stmt, len(s.List))
+		res := make([]ast.Stmt, len(s.List))
 		for i, inner := range s.List {
-			newList[i] = f.convertDefineToAssign(inner)
+			res[i] = f.convertDefineToAssign(inner, hoistedVars)
 		}
-		return &ast.BlockStmt{List: newList}
+		return &ast.BlockStmt{List: res}
 	case *ast.IfStmt:
 		if s.Init != nil {
-			s.Init = f.convertDefineToAssign(s.Init)
+			s.Init = f.convertDefineToAssign(s.Init, hoistedVars)
 		}
-		s.Body = f.convertDefineToAssign(s.Body).(*ast.BlockStmt)
+		s.Body = f.convertDefineToAssign(s.Body, hoistedVars).(*ast.BlockStmt)
 		if s.Else != nil {
-			if elseBlock, ok := s.Else.(*ast.BlockStmt); ok {
-				s.Else = f.convertDefineToAssign(elseBlock)
+			if eb, ok := s.Else.(*ast.BlockStmt); ok {
+				s.Else = f.convertDefineToAssign(eb, hoistedVars)
 			}
 		}
 		return s
 	case *ast.ForStmt:
 		if s.Init != nil {
-			s.Init = f.convertDefineToAssign(s.Init)
+			s.Init = f.convertDefineToAssign(s.Init, hoistedVars)
 		}
-		s.Body = f.convertDefineToAssign(s.Body).(*ast.BlockStmt)
+		s.Body = f.convertDefineToAssign(s.Body, hoistedVars).(*ast.BlockStmt)
 		return s
 	case *ast.RangeStmt:
-		if s.Tok == token.DEFINE {
-			s.Tok = token.ASSIGN
+		// Preserve := in range loops
+		if s.Body != nil {
+			s.Body = f.convertDefineToAssign(s.Body, hoistedVars).(*ast.BlockStmt)
 		}
-		s.Body = f.convertDefineToAssign(s.Body).(*ast.BlockStmt)
 		return s
 	}
 	return stmt
+}
+
+func toExprs(idents []*ast.Ident) []ast.Expr {
+	exprs := make([]ast.Expr, len(idents))
+	for i, id := range idents {
+		exprs[i] = id
+	}
+	return exprs
+}
+
+func (f *CFF) typeToAST(t types.Type, currentPkgName string) ast.Expr {
+	switch typ := t.(type) {
+	case *types.Basic:
+		switch typ.Kind() {
+		case types.String:
+			return &ast.Ident{Name: "string"}
+		case types.Int, types.Int8, types.Int16, types.Int64:
+			return &ast.Ident{Name: "int"}
+		case types.Int32:
+			return &ast.Ident{Name: "rune"}
+		case types.Uint, types.Uint16, types.Uint32, types.Uint64, types.Uintptr:
+			return &ast.Ident{Name: "uint"}
+		case types.Uint8:
+			return &ast.Ident{Name: "byte"}
+		case types.Float32, types.Float64:
+			return &ast.Ident{Name: "float64"}
+		case types.Bool:
+			return &ast.Ident{Name: "bool"}
+		case types.UnsafePointer:
+			return &ast.Ident{Name: "unsafe.Pointer"}
+		default:
+			return &ast.Ident{Name: "interface{}"}
+		}
+	case *types.Pointer:
+		return &ast.StarExpr{X: f.typeToAST(typ.Elem(), currentPkgName)}
+	case *types.Slice:
+		elem := f.typeToAST(typ.Elem(), currentPkgName)
+		if basic, ok := typ.Elem().(*types.Basic); ok && basic.Kind() == types.Uint8 {
+			return &ast.ArrayType{Len: nil, Elt: &ast.Ident{Name: "byte"}}
+		}
+		return &ast.ArrayType{Len: nil, Elt: elem}
+	case *types.Array:
+		return &ast.ArrayType{
+			Len: &ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("%d", typ.Len())},
+			Elt: f.typeToAST(typ.Elem(), currentPkgName),
+		}
+	case *types.Chan:
+		return &ast.ChanType{Value: f.typeToAST(typ.Elem(), currentPkgName)}
+	case *types.Map:
+		return &ast.MapType{
+			Key:   f.typeToAST(typ.Key(), currentPkgName),
+			Value: f.typeToAST(typ.Elem(), currentPkgName),
+		}
+	case *types.Named:
+		obj := typ.Obj()
+		pkg := obj.Pkg()
+		typeName := obj.Name()
+		// Skip package qualifier if type is from the same package
+		if pkg != nil && pkg.Name() == currentPkgName {
+			return &ast.Ident{Name: typeName}
+		}
+		if pkg != nil {
+			return &ast.SelectorExpr{
+				X:   &ast.Ident{Name: pkg.Name()},
+				Sel: &ast.Ident{Name: typeName},
+			}
+		}
+		return &ast.Ident{Name: typeName}
+	case *types.Struct, *types.Interface, *types.Signature:
+		return &ast.Ident{Name: "interface{}"}
+	case *types.Tuple:
+		if typ.Len() > 0 {
+			return f.typeToAST(typ.At(0).Type(), currentPkgName)
+		}
+		return &ast.Ident{Name: "interface{}"}
+	}
+	return &ast.Ident{Name: "interface{}"}
+}
+
+func (f *CFF) hasAnonymousStructTypeAssertion(stmts []ast.Stmt) bool {
+	for _, stmt := range stmts {
+		found := false
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			if found {
+				return false
+			}
+			if ta, ok := n.(*ast.TypeAssertExpr); ok && ta.Type != nil {
+				if _, isStruct := ta.Type.(*ast.StructType); isStruct {
+					found = true
+					return false
+				}
+			}
+			return true
+		})
+		if found {
+			return true
+		}
+	}
+	return false
 }

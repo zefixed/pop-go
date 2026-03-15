@@ -1,10 +1,12 @@
 package builder
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	pkgfs "pop-go/pkg/fs"
 	"time"
 )
 
@@ -19,29 +21,22 @@ func (b *Builder) Build() error {
 	// Adding output (-o) flag
 	outputPath, err := filepath.Abs(b.cfg.Builder.OutputPath)
 	if err != nil {
-		b.log.Error(
-			b.cfg.CurLocale["bld.err.abs"],
-			slog.String("error", err.Error()),
-		)
+		b.log.Error(b.cfg.CurLocale["bld.err.abs"], slog.String("error", err.Error()))
 		return err
 	}
 	if b.cfg.Builder.OutputPath != "" {
 		args = append(args, "-o", outputPath)
 	}
 
-	// Adding target path flag
-	targetPath, err := filepath.Abs(b.cfg.Obfuscator.TargetPath)
+	// Adding path to main.go
+	mainPath, err := b.findMain()
 	if err != nil {
-		b.log.Error(
-			b.cfg.CurLocale["bld.err.abs"],
-			slog.String("error", err.Error()),
-		)
+		b.log.Error(b.cfg.CurLocale["bld.err.main"], slog.String("error", err.Error()))
 		return err
 	}
-	if b.cfg.Obfuscator.TargetPath != "" {
-		args = append(args, targetPath)
-	}
+	args = append(args, mainPath)
 
+	// Executing go build command
 	cmd := exec.Command("go", args...)
 
 	cmd.Dir = b.cfg.Obfuscator.TargetPath
@@ -60,14 +55,26 @@ func (b *Builder) Build() error {
 	t := time.Now()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		b.log.Error(
-			b.cfg.CurLocale["bld.err"],
-			slog.String("error", err.Error()),
-			slog.String("output", string(output)),
-		)
+		b.log.Error(b.cfg.CurLocale["bld.err"], slog.String("error", err.Error()), slog.String("output", string(output)))
 		return err
 	}
 
 	b.log.Info(b.cfg.CurLocale["bld.info.end"], slog.String("duration", time.Since(t).String()))
 	return nil
+}
+
+func (b *Builder) findMain() (string, error) {
+	snapshot, err := pkgfs.TakeSnapshot(b.cfg.Obfuscator.TargetPath)
+	if err != nil {
+		return "", err
+	}
+
+	for _, file := range snapshot {
+		if filepath.Base(file) == "main.go" {
+			dir, _ := filepath.Split(file)
+			return dir, nil
+		}
+	}
+
+	return "", errors.New("not found main.go")
 }

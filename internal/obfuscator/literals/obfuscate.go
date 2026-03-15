@@ -85,9 +85,21 @@ func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile Obfusc
 		}
 	}
 
-	// Обработка строковых литералов
-	astutil.Apply(f, nil, func(cursor *astutil.Cursor) bool {
+	// Process literals in pre-handler to allow safe node replacement.
+	// Return false after replacement to skip traversing children of the new node.
+	astutil.Apply(f, func(cursor *astutil.Cursor) bool {
 		if lit, ok := cursor.Node().(*ast.BasicLit); ok && lit.Kind == token.STRING {
+			// Skip struct tags: they are stored as *ast.BasicLit in ast.Field.Tag,
+			// which is not an ast.Expr field and cannot be replaced with CallExpr.
+			if parent, ok := cursor.Parent().(*ast.Field); ok && parent.Tag == lit {
+				return true
+			}
+
+			// Skip import paths: they are also BasicLit but not replaceable with CallExpr
+			if _, ok := cursor.Parent().(*ast.ImportSpec); ok {
+				return true
+			}
+
 			parent := cursor.Parent()
 			if call, ok := parent.(*ast.CallExpr); ok {
 				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == decryptFuncName {
@@ -95,7 +107,7 @@ func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile Obfusc
 				}
 			}
 
-			if isCompilerDirective(lit.Value) || isImportString(cursor) {
+			if isCompilerDirective(lit.Value) {
 				return true
 			}
 
@@ -112,23 +124,16 @@ func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile Obfusc
 			}
 
 			cursor.Replace(call)
+			return false
 		}
 		return true
-	})
+	}, nil)
 
 	return nil
 }
 
 func isCompilerDirective(s string) bool {
 	return len(s) > 4 && s[0:4] == `"//g`
-}
-
-func isImportString(cursor *astutil.Cursor) bool {
-	parent := cursor.Parent()
-	if _, ok := parent.(*ast.ImportSpec); ok {
-		return true
-	}
-	return false
 }
 
 func hasImport(f *ast.File, path string) bool {

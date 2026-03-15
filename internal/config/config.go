@@ -1,9 +1,11 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"path/filepath"
 	"pop-go/internal/app"
 	"pop-go/internal/models"
 	pkgfs "pop-go/pkg/fs"
@@ -16,6 +18,12 @@ func validateConfig() error {
 	langs, err := pkgfs.TakeSnapshot("./locales")
 	if err != nil {
 		return fmt.Errorf("error reading locales directory: %w", err)
+	}
+
+	// Trimming path
+	for i, lang := range langs {
+		_, name := filepath.Split(lang)
+		langs[i] = name
 	}
 
 	// Checking that the specified locale is present in the ./locales
@@ -75,8 +83,8 @@ func validateConfig() error {
 				strings.Join(literalsLevel, ", "),
 			)
 		}
-
-		cfg.Obfuscator.Literals.Enable = true
+	} else if cfg.Obfuscator.Literals.Enable {
+		return errors.New("obfuscating literals is enabled but level is empty")
 	}
 
 	// Checking that GOOS is correct
