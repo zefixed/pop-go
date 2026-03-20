@@ -18,13 +18,23 @@ func (b *Builder) Build() error {
 		args = append(args, b.cfg.Builder.Flags...)
 	}
 
-	// Adding output (-o) flag
+	// Getting output path
 	outputPath, err := filepath.Abs(b.cfg.Builder.OutputPath)
 	if err != nil {
 		b.log.Error(b.cfg.CurLocale["bld.err.abs"], slog.String("error", err.Error()))
 		return err
 	}
+
+	// Adding output (-o) flag
 	if b.cfg.Builder.OutputPath != "" {
+		info, statErr := os.Stat(outputPath)
+		if statErr == nil && info.IsDir() {
+			binaryName := b.cfg.Builder.BinaryName
+			if binaryName == "" {
+				binaryName = filepath.Base(b.cfg.Obfuscator.TargetPath)
+			}
+			outputPath = filepath.Join(outputPath, binaryName)
+		}
 		args = append(args, "-o", outputPath)
 	}
 

@@ -55,4 +55,5 @@ type Builder struct {
 	GOOS       string   `json:"goos" mapstructure:"goos"`
 	GOARCH     string   `json:"goarch" mapstructure:"goarch"`
 	OutputPath string   `json:"output_path" mapstructure:"output_path"`
+	BinaryName string   `json:"binary_name" mapstructure:"binary_name"`
 }

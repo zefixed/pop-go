@@ -3,14 +3,15 @@ package config
 import (
 	"errors"
 	"fmt"
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 	"path/filepath"
 	"pop-go/internal/app"
 	"pop-go/internal/models"
 	pkgfs "pop-go/pkg/fs"
 	"slices"
 	"strings"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
 func validateConfig() error {
@@ -240,13 +241,15 @@ func initControlFlow() {
 
 func initBuilder() {
 	var flags []string
-	var goos, goarch, outputPath string
+	var goos, goarch, outputPath, binaryName string
 	rootCmd.Flags().StringSliceVar(&flags, "builder-flags", []string{"-ldflags", "-s -w", "-trimpath"}, "Passes the flags to the go builder. Example: --builder-flags=\"-ldflags,-s -w,-trimpath\"")
 	rootCmd.Flags().StringVar(&goos, "goos", "windows", "Target operating system (linux, windows).")
 	rootCmd.Flags().StringVar(&goarch, "goarch", "amd64", "Target processor architecture (amd64, arm64).")
 	rootCmd.Flags().StringVarP(&outputPath, "output-path", "o", ".", "The path to save the compiled binary file.")
+	rootCmd.Flags().StringVar(&binaryName, "binary-name", "", "The name of the output binary file, if not specified, the package name will be taken.")
 	_ = viper.BindPFlag("builder.flags", rootCmd.Flags().Lookup("builder-flags"))
 	_ = viper.BindPFlag("builder.goos", rootCmd.Flags().Lookup("goos"))
 	_ = viper.BindPFlag("builder.goarch", rootCmd.Flags().Lookup("goarch"))
 	_ = viper.BindPFlag("builder.output_path", rootCmd.Flags().Lookup("output-path"))
+	_ = viper.BindPFlag("builder.binary_name", rootCmd.Flags().Lookup("binary-name"))
 }

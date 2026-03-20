@@ -1,16 +1,16 @@
 package cff
 
 import (
-	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"pop-go/internal/models"
+
+	"golang.org/x/tools/go/packages"
 )
 
 type CFF struct {
-	cfg         *models.Config
-	log         *slog.Logger
-	pkgs        []*packages.Package
-	hoistedVars map[string]bool // Track hoisted variables per function
+	cfg  *models.Config
+	log  *slog.Logger
+	pkgs []*packages.Package
 }
 
 func NewCFF(cfg *models.Config, log *slog.Logger, pkgs []*packages.Package) *CFF {

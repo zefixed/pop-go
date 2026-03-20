@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"golang.org/x/tools/go/ast/astutil"
 	"log/slog"
 	"pop-go/pkg/util"
@@ -31,7 +32,7 @@ func (l *Literals) Obfuscate(level string) error {
 			l.log.Debug(l.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", absPath))
 
 			// Obfuscate literals in file with given obfuscation profile
-			if err := l.obfuscateAST(file, pkg.Fset, profile); err != nil {
+			if err := l.obfuscateAST(file, pkg.Fset, profile, pkg.TypesInfo); err != nil {
 				return fmt.Errorf(l.cfg.CurLocale["obf.err.lit"], absPath, err)
 			}
 		}
@@ -53,7 +54,7 @@ func getObfuscationProfile(level string) ObfuscateLiteralsProfile {
 	return nil
 }
 
-func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile ObfuscateLiteralsProfile) error {
+func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile ObfuscateLiteralsProfile, typesInfo *types.Info) error {
 	decryptKey := profile.GenerateKey(l.cfg.Obfuscator.Seed)
 	decryptFuncName := util.GenerateUniqueName(l.cfg.Obfuscator.Seed)
 	decryptFunc := profile.DecryptFunction(decryptKey, decryptFuncName)
@@ -88,6 +89,12 @@ func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile Obfusc
 	// Process literals in pre-handler to allow safe node replacement.
 	// Return false after replacement to skip traversing children of the new node.
 	astutil.Apply(f, func(cursor *astutil.Cursor) bool {
+		// Skip const declarations entirely — const values must be compile-time
+		// constants, and function calls are not allowed there.
+		if genDecl, ok := cursor.Node().(*ast.GenDecl); ok && genDecl.Tok == token.CONST {
+			return false
+		}
+
 		if lit, ok := cursor.Node().(*ast.BasicLit); ok && lit.Kind == token.STRING {
 			// Skip struct tags: they are stored as *ast.BasicLit in ast.Field.Tag,
 			// which is not an ast.Expr field and cannot be replaced with CallExpr.
@@ -105,6 +112,15 @@ func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile Obfusc
 				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == decryptFuncName {
 					return true
 				}
+				// Skip literals used as arguments to type conversions (e.g. TestType("value")).
+				// The parent CallExpr is a type conversion when Fun is an Ident or SelectorExpr
+				// that refers to a named type — replacing the string with DecryptFunc("...") would
+				// produce an incompatible type (string instead of the named type).
+				switch call.Fun.(type) {
+				case *ast.Ident, *ast.SelectorExpr:
+					// Could be a type conversion — conservatively skip all such literals.
+					return true
+				}
 			}
 
 			if isCompilerDirective(lit.Value) {
@@ -112,6 +128,11 @@ func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile Obfusc
 			}
 
 			s, _ := strconv.Unquote(lit.Value)
+			// Skip empty strings — obfuscating "" produces DecryptFunc("") which
+			// returns string and breaks assignments to named string types (e.g. type TestType string).
+			if s == "" {
+				return true
+			}
 			enc := profile.EncryptString(s, decryptKey)
 			newLit := &ast.BasicLit{
 				ValuePos: lit.ValuePos,

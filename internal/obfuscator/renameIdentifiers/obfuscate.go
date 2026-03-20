@@ -53,8 +53,17 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 	renameMap := make(map[types.Object]string)
 	importedNames := i.collectImportedNames(pkg.Syntax)
 
+	// Secondary map for anonymous struct fields: (structTypeString + "." + fieldName) → newName.
+	anonFieldNames := make(map[string]string)
+
+	// Secondary map for methods: originalMethodName → newName.
+	// Interface methods and their implementing struct methods are different types.Object
+	// entries, but they must receive the SAME renamed identifier. Without this map,
+	// renaming "available" on the interface and "available" on the struct independently
+	// would produce different names, breaking the interface satisfaction check.
+	methodNames := make(map[string]string)
+
 	for _, file := range pkg.Syntax {
-		// Collect type switch variables to exclude them from renaming
 		typeSwitchVars := collectTypeSwitchVars(file)
 
 		processed := make(map[token.Pos]bool)
@@ -65,7 +74,6 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 			}
 			processed[ident.Pos()] = true
 
-			// Skip type switch variables - they have special scoping and type behavior
 			if typeSwitchVars[ident.Pos()] {
 				return true
 			}
@@ -77,6 +85,36 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 			obj := pkg.TypesInfo.ObjectOf(ident)
 			if obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == currentPkgPath {
 				if _, exists := renameMap[obj]; !exists {
+					// For fields of anonymous structs, use canonical key for consistency.
+					if field, ok := obj.(*types.Var); ok && field.IsField() {
+						if canonicalKey := anonStructFieldKey(field, pkg.TypesInfo); canonicalKey != "" {
+							if existing, ok := anonFieldNames[canonicalKey]; ok {
+								renameMap[obj] = existing
+							} else {
+								newName := util.GenerateUniqueName(i.cfg.Obfuscator.Seed)
+								renameMap[obj] = newName
+								anonFieldNames[canonicalKey] = newName
+							}
+							return true
+						}
+					}
+
+					// For methods (interface or struct), use the original method name as
+					// a grouping key so that all methods named e.g. "available" in this
+					// package receive the same obfuscated name. This ensures interface
+					// methods and their implementing struct methods stay in sync.
+					if fn, ok := obj.(*types.Func); ok && fn.Type().(*types.Signature).Recv() != nil {
+						origName := ident.Name
+						if existing, ok := methodNames[origName]; ok {
+							renameMap[obj] = existing
+						} else {
+							newName := util.GenerateUniqueName(i.cfg.Obfuscator.Seed)
+							renameMap[obj] = newName
+							methodNames[origName] = newName
+						}
+						return true
+					}
+
 					renameMap[obj] = util.GenerateUniqueName(i.cfg.Obfuscator.Seed)
 				}
 			}
@@ -86,6 +124,34 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 	}
 
 	return renameMap
+}
+
+// anonStructFieldKey returns a canonical string key for a field of an anonymous struct type.
+// The key is "<structTypeString>.<fieldName>", e.g. "struct{ip string; domain string}.ip".
+// Returns "" if the field belongs to a named (non-anonymous) struct — those are keyed by
+// their types.Object directly, which is already unique and stable.
+func anonStructFieldKey(field *types.Var, typesInfo *types.Info) string {
+	if typesInfo == nil {
+		return ""
+	}
+	// Walk all types in the package to find the anonymous struct containing this field.
+	for expr, tv := range typesInfo.Types {
+		st, ok := tv.Type.(*types.Struct)
+		if !ok {
+			continue
+		}
+		// Only anonymous structs — named structs are handled by their object key.
+		if _, isNamed := expr.(*ast.StructType); !isNamed {
+			continue
+		}
+		for fi := 0; fi < st.NumFields(); fi++ {
+			if st.Field(fi) == field {
+				// Found the anonymous struct containing this field.
+				return types.TypeString(st, nil) + "." + field.Name()
+			}
+		}
+	}
+	return ""
 }
 
 // collectTypeSwitchVars collects all positions of type switch variables
