@@ -277,11 +277,18 @@ func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliase
 
 	var cases []ast.Stmt
 	n := len(originalStmts)
+	// Build a zero-value return statement for use as the terminal transition.
+	// A plain `return` without values is only valid for void functions.
+	// For functions with return types we must return zero values to satisfy the compiler.
+	// (This return is always unreachable in practice — it only follows the last real
+	// statement which is itself a return — but the compiler still type-checks it.)
+	terminalReturn := f.buildZeroReturn(fn.Type.Results, currentPkgPath, currentNames, pkgAliases, imports)
+
 	for i, stmt := range originalStmts {
 		processed := f.convertDefineToAssign(stmt, hoistedVars)
 		var trans ast.Stmt
 		if i == n-1 {
-			trans = &ast.BranchStmt{Tok: token.BREAK}
+			trans = terminalReturn
 		} else {
 			trans = &ast.AssignStmt{
 				Tok: token.ASSIGN,
@@ -294,7 +301,7 @@ func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliase
 			Body: []ast.Stmt{&ast.BlockStmt{List: []ast.Stmt{processed, trans}}},
 		})
 	}
-	cases = append(cases, &ast.CaseClause{Body: []ast.Stmt{&ast.BranchStmt{Tok: token.BREAK}}})
+	cases = append(cases, &ast.CaseClause{Body: []ast.Stmt{terminalReturn}})
 
 	finalBody := append(hoistedDecls, &ast.AssignStmt{
 		Tok: token.DEFINE,
@@ -796,6 +803,61 @@ func toExprs(idents []*ast.Ident) []ast.Expr {
 		exprs[i] = id
 	}
 	return exprs
+}
+
+// buildZeroReturn constructs a return statement with zero values for each
+// result type in the function signature. For void functions returns `return`.
+// This is needed as the terminal transition in the CFF state machine because
+// a plain `return` without values is invalid in non-void functions.
+func (f *CFF) buildZeroReturn(results *ast.FieldList, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) *ast.ReturnStmt {
+	if results == nil || len(results.List) == 0 {
+		return &ast.ReturnStmt{}
+	}
+	var retVals []ast.Expr
+	for _, field := range results.List {
+		count := len(field.Names)
+		if count == 0 {
+			count = 1
+		}
+		for j := 0; j < count; j++ {
+			retVals = append(retVals, zeroValueForType(field.Type))
+		}
+	}
+	return &ast.ReturnStmt{Results: retVals}
+}
+
+// zeroValueForType returns an AST expression for the zero value of the given
+// type expression. Used to build valid return statements in non-void functions.
+func zeroValueForType(t ast.Expr) ast.Expr {
+	switch typ := t.(type) {
+	case *ast.Ident:
+		switch typ.Name {
+		case "bool":
+			return &ast.Ident{Name: "false"}
+		case "string":
+			return &ast.BasicLit{Kind: token.STRING, Value: `""`}
+		case "int", "int8", "int16", "int32", "int64",
+			"uint", "uint8", "uint16", "uint32", "uint64",
+			"uintptr", "byte", "rune", "float32", "float64",
+			"complex64", "complex128":
+			return &ast.BasicLit{Kind: token.INT, Value: "0"}
+		default:
+			// Named type — return zero composite literal: TypeName{}
+			return &ast.CompositeLit{Type: t}
+		}
+	case *ast.StarExpr:
+		return &ast.Ident{Name: "nil"}
+	case *ast.ArrayType, *ast.MapType, *ast.ChanType, *ast.FuncType:
+		return &ast.Ident{Name: "nil"}
+	case *ast.InterfaceType:
+		return &ast.Ident{Name: "nil"}
+	case *ast.SelectorExpr:
+		// Qualified type from another package (e.g. time.Duration, http.Handler)
+		return &ast.CompositeLit{Type: t}
+	case *ast.StructType:
+		return &ast.CompositeLit{Type: t}
+	}
+	return &ast.Ident{Name: "nil"}
 }
 
 func (f *CFF) typeToAST(t types.Type, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) ast.Expr {

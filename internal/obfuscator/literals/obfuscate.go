@@ -113,13 +113,22 @@ func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile Obfusc
 					return true
 				}
 				// Skip literals used as arguments to type conversions (e.g. TestType("value")).
-				// The parent CallExpr is a type conversion when Fun is an Ident or SelectorExpr
-				// that refers to a named type — replacing the string with DecryptFunc("...") would
-				// produce an incompatible type (string instead of the named type).
-				switch call.Fun.(type) {
-				case *ast.Ident, *ast.SelectorExpr:
-					// Could be a type conversion — conservatively skip all such literals.
-					return true
+				// A type conversion has exactly one argument and Fun refers to a type, not a function.
+				// We use typesInfo to distinguish: if Fun's type is a *types.Signature, it's a
+				// function call (safe to obfuscate). If it's any other type, it's a conversion.
+				if typesInfo != nil {
+					if tv, ok := typesInfo.Types[call.Fun]; ok {
+						if _, isSig := tv.Type.(*types.Signature); !isSig {
+							// Fun is a type, not a function — this is a type conversion, skip.
+							return true
+						}
+					}
+				} else {
+					// No type info: conservatively skip single-arg calls with bare Ident Fun
+					// (e.g. MyType("value")) but allow SelectorExpr calls (fmt.Printf etc.)
+					if _, ok := call.Fun.(*ast.Ident); ok && len(call.Args) == 1 {
+						return true
+					}
 				}
 			}
 
