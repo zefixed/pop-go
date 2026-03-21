@@ -1,9 +1,10 @@
 package cff
 
 import (
-	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"pop-go/internal/models"
+
+	"golang.org/x/tools/go/packages"
 )
 
 type CFF struct {

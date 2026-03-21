@@ -1,7 +1,7 @@
 package fs
 
 import (
-	"os"
+	"io/fs"
 	"path/filepath"
 )
 
@@ -11,17 +11,20 @@ func TakeSnapshot(dir string) ([]string, error) {
 		return nil, err
 	}
 
-	dirEntries, err := os.ReadDir(abs)
+	var files []string
+	err = filepath.WalkDir(abs, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+
 	if err != nil {
 		return nil, err
 	}
 
-	var dirs []string
-	for _, entry := range dirEntries {
-		if !entry.IsDir() {
-			dirs = append(dirs, entry.Name())
-		}
-	}
-
-	return dirs, nil
+	return files, nil
 }

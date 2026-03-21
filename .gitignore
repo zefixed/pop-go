@@ -2,6 +2,7 @@
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
 #
 # Binaries for programs and plugins
+output
 *.exe
 *.exe~
 *.dll
@@ -33,3 +34,5 @@ go.work.sum
 
 # Logfile
 .log
+
+config.json

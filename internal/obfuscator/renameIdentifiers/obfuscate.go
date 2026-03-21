@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"go/types"
 	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"pop-go/pkg/util"
 	"strings"
@@ -31,12 +32,14 @@ func (i *RenameIdentifiers) Obfuscate() error {
 			continue
 		}
 
+		// Build package-level rename map for consistent renaming across all files
+		renameMap := i.buildRenameMap(pkg, pkg.PkgPath)
+
 		for _, file := range pkg.Syntax {
 			absPath := pkg.Fset.File(file.Pos()).Name()
 			i.log.Debug(i.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", absPath))
 
-			// Modifying the AST
-			if err := i.obfuscateAST(file, pkg.TypesInfo, pkg.PkgPath); err != nil {
+			if err := i.applyRenameMap(file, pkg.TypesInfo, renameMap); err != nil {
 				return fmt.Errorf(i.cfg.CurLocale["obf.err.ren.ids"], absPath, err)
 			}
 		}
@@ -46,68 +49,161 @@ func (i *RenameIdentifiers) Obfuscate() error {
 	return nil
 }
 
-func (i *RenameIdentifiers) obfuscateAST(f *ast.File, typesInfo *types.Info, currentPkgPath string) error {
-	renameMap := make(map[string]string)
-	processed := make(map[token.Pos]bool)
+func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath string) map[types.Object]string {
+	renameMap := make(map[types.Object]string)
+	importedNames := i.collectImportedNames(pkg.Syntax)
 
-	// Collecting all the names of the imported packages
-	importedNames := make(map[string]bool)
-	for _, imp := range f.Imports {
-		if imp.Name != nil {
-			if imp.Name.Name != "_" && imp.Name.Name != "." {
-				importedNames[imp.Name.Name] = true
+	// Secondary map for anonymous struct fields: (structTypeString + "." + fieldName) → newName.
+	anonFieldNames := make(map[string]string)
+
+	// Secondary map for methods: originalMethodName → newName.
+	// Interface methods and their implementing struct methods are different types.Object
+	// entries, but they must receive the SAME renamed identifier. Without this map,
+	// renaming "available" on the interface and "available" on the struct independently
+	// would produce different names, breaking the interface satisfaction check.
+	methodNames := make(map[string]string)
+
+	for _, file := range pkg.Syntax {
+		typeSwitchVars := collectTypeSwitchVars(file)
+
+		processed := make(map[token.Pos]bool)
+		ast.Inspect(file, func(n ast.Node) bool {
+			ident, ok := n.(*ast.Ident)
+			if !ok || ident == nil || processed[ident.Pos()] {
+				return true
 			}
-		} else {
-			path := strings.Trim(imp.Path.Value, `"`)
-			parts := strings.Split(path, "/")
-			importedNames[parts[len(parts)-1]] = true
-		}
+			processed[ident.Pos()] = true
+
+			if typeSwitchVars[ident.Pos()] {
+				return true
+			}
+
+			if !shouldRename(ident, file, pkg.TypesInfo, currentPkgPath, importedNames) {
+				return true
+			}
+
+			obj := pkg.TypesInfo.ObjectOf(ident)
+			if obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == currentPkgPath {
+				if _, exists := renameMap[obj]; !exists {
+					// For fields of anonymous structs, use canonical key for consistency.
+					if field, ok := obj.(*types.Var); ok && field.IsField() {
+						if canonicalKey := anonStructFieldKey(field, pkg.TypesInfo); canonicalKey != "" {
+							if existing, ok := anonFieldNames[canonicalKey]; ok {
+								renameMap[obj] = existing
+							} else {
+								newName := util.GenerateUniqueName(i.cfg.Obfuscator.Seed)
+								renameMap[obj] = newName
+								anonFieldNames[canonicalKey] = newName
+							}
+							return true
+						}
+					}
+
+					// For methods (interface or struct), use the original method name as
+					// a grouping key so that all methods named e.g. "available" in this
+					// package receive the same obfuscated name. This ensures interface
+					// methods and their implementing struct methods stay in sync.
+					if fn, ok := obj.(*types.Func); ok && fn.Type().(*types.Signature).Recv() != nil {
+						origName := ident.Name
+						if existing, ok := methodNames[origName]; ok {
+							renameMap[obj] = existing
+						} else {
+							newName := util.GenerateUniqueName(i.cfg.Obfuscator.Seed)
+							renameMap[obj] = newName
+							methodNames[origName] = newName
+						}
+						return true
+					}
+
+					renameMap[obj] = util.GenerateUniqueName(i.cfg.Obfuscator.Seed)
+				}
+			}
+
+			return true
+		})
 	}
 
-	// Collect all the positions of the identifiers in SelectorExpr.X (for example, pkg in pkg.Func)
-	selectorPositions := make(map[token.Pos]bool)
-	ast.Inspect(f, func(n ast.Node) bool {
-		if sel, ok := n.(*ast.SelectorExpr); ok {
-			if ident, ok := sel.X.(*ast.Ident); ok {
-				selectorPositions[ident.Pos()] = true
+	return renameMap
+}
+
+// anonStructFieldKey returns a canonical string key for a field of an anonymous struct type.
+// The key is "<structTypeString>.<fieldName>", e.g. "struct{ip string; domain string}.ip".
+// Returns "" if the field belongs to a named (non-anonymous) struct — those are keyed by
+// their types.Object directly, which is already unique and stable.
+func anonStructFieldKey(field *types.Var, typesInfo *types.Info) string {
+	if typesInfo == nil {
+		return ""
+	}
+	// Walk all types in the package to find the anonymous struct containing this field.
+	for expr, tv := range typesInfo.Types {
+		st, ok := tv.Type.(*types.Struct)
+		if !ok {
+			continue
+		}
+		// Only anonymous structs — named structs are handled by their object key.
+		if _, isNamed := expr.(*ast.StructType); !isNamed {
+			continue
+		}
+		for fi := 0; fi < st.NumFields(); fi++ {
+			if st.Field(fi) == field {
+				// Found the anonymous struct containing this field.
+				return types.TypeString(st, nil) + "." + field.Name()
 			}
 		}
+	}
+	return ""
+}
+
+// collectTypeSwitchVars collects all positions of type switch variables
+// including the declaration and all uses within case clauses
+func collectTypeSwitchVars(file *ast.File) map[token.Pos]bool {
+	vars := make(map[token.Pos]bool)
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		ts, ok := n.(*ast.TypeSwitchStmt)
+		if !ok || ts.Assign == nil {
+			return true
+		}
+
+		// Get the type switch variable from the assignment
+		var typeSwitchVar *ast.Ident
+		if assign, ok := ts.Assign.(*ast.AssignStmt); ok && len(assign.Lhs) > 0 {
+			if ident, ok := assign.Lhs[0].(*ast.Ident); ok {
+				typeSwitchVar = ident
+				vars[ident.Pos()] = true
+			}
+		}
+
+		if typeSwitchVar == nil {
+			return true
+		}
+
+		// Collect all uses of this variable within the type switch body
+		ast.Inspect(ts.Body, func(inner ast.Node) bool {
+			if ident, ok := inner.(*ast.Ident); ok && ident.Name == typeSwitchVar.Name {
+				vars[ident.Pos()] = true
+			}
+			return true
+		})
+
 		return true
 	})
 
-	// First pass: collecting identifiers for renaming
-	ast.Inspect(f, func(n ast.Node) bool {
-		ident, ok := n.(*ast.Ident)
-		if !ok || ident == nil || processed[ident.Pos()] {
-			return true
-		}
-		processed[ident.Pos()] = true
+	return vars
+}
 
-		if !shouldRename(ident, f, typesInfo, currentPkgPath, importedNames, selectorPositions) {
-			return true
-		}
-
-		name := ident.Name
-		if _, exists := renameMap[name]; !exists {
-			renameMap[name] = util.GenerateUniqueName(i.cfg.Obfuscator.Seed)
-		}
-
-		return true
-	})
-
-	// Second pass: replacing IDs
+func (i *RenameIdentifiers) applyRenameMap(f *ast.File, typesInfo *types.Info, renameMap map[types.Object]string) error {
 	astutil.Apply(f, nil, func(cursor *astutil.Cursor) bool {
 		ident, ok := cursor.Node().(*ast.Ident)
 		if !ok || ident == nil {
 			return true
 		}
 
-		if !shouldRename(ident, f, typesInfo, currentPkgPath, importedNames, selectorPositions) {
-			return true
-		}
-
-		if newName, exists := renameMap[ident.Name]; exists {
-			ident.Name = newName
+		obj := typesInfo.ObjectOf(ident)
+		if obj != nil {
+			if newName, exists := renameMap[obj]; exists {
+				ident.Name = newName
+			}
 		}
 
 		return true
@@ -116,78 +212,65 @@ func (i *RenameIdentifiers) obfuscateAST(f *ast.File, typesInfo *types.Info, cur
 	return nil
 }
 
-func shouldRename(ident *ast.Ident, file *ast.File, typesInfo *types.Info, currentPkgPath string, importedNames map[string]bool, selectorPositions map[token.Pos]bool) bool {
+func (i *RenameIdentifiers) collectImportedNames(files []*ast.File) map[string]bool {
+	importedNames := make(map[string]bool)
+	for _, f := range files {
+		for _, imp := range f.Imports {
+			if imp.Name != nil {
+				if imp.Name.Name != "_" && imp.Name.Name != "." {
+					importedNames[imp.Name.Name] = true
+				}
+			} else {
+				path := strings.Trim(imp.Path.Value, `"`)
+				parts := strings.Split(path, "/")
+				importedNames[parts[len(parts)-1]] = true
+			}
+		}
+	}
+	return importedNames
+}
+
+func shouldRename(ident *ast.Ident, file *ast.File, typesInfo *types.Info, currentPkgPath string, importedNames map[string]bool) bool {
 	name := ident.Name
-	// Fast path: Check conditions that don't require external data first
-	// Skip exported identifiers early as they are common and easy to check
 	if ast.IsExported(name) {
 		return false
 	}
 
-	// Skip special identifiers like blank identifier, init, main
 	if name == "_" || name == "init" || name == "main" {
 		return false
 	}
 
-	// Skip built-in types and functions early before accessing complex data structures
 	if isBuiltinType(name) {
 		return false
 	}
 
-	// Skip the package name in the file declaration if this identifier matches it
 	if file.Name != nil && file.Name.Pos() == ident.Pos() {
 		return false
 	}
 
-	// Handle identifiers that appear on the left side of selectors (e.g., pkg.Func)
-	// These are likely package names and should not be renamed
-	if selectorPositions[ident.Pos()] {
-		// Check against known imported names in this file
-		if importedNames[name] {
-			return false
-		}
-		// Check against standard library package names
-		if standardPackageNames[name] {
-			return false
-		}
-		// Use type information to confirm if this is a package name
-		if typesInfo != nil {
-			if obj := typesInfo.ObjectOf(ident); obj != nil {
-				if _, ok := obj.(*types.PkgName); ok {
-					return false
-				}
-			}
-		}
-	}
-
-	// Perform additional checks only if type information is available
 	if typesInfo != nil {
 		obj := typesInfo.ObjectOf(ident)
 		if obj == nil {
-			// If no object information is available, we cannot make a decision based on types,
-			// so proceed with renaming unless already excluded above
 			return true
 		}
 
-		// Skip embedded fields or unqualified identifiers that have no associated package
-		if obj.Pkg() == nil {
-			return false
-		}
-
-		// Avoid renaming package names identified through type information
-		// This check was duplicated earlier; now consolidated here
 		if _, ok := obj.(*types.PkgName); ok {
 			return false
 		}
 
-		// Skip identifiers originating from standard library packages
-		// Compare package paths to determine origin
+		if obj.Pkg() == nil {
+			return false
+		}
+
+		if obj.Pkg().Path() != currentPkgPath {
+			return false
+		}
+
 		if isStandardPackagePath(obj.Pkg().Path(), currentPkgPath) {
 			return false
 		}
 	}
 
-	// If all checks pass, this identifier can be safely renamed
 	return true
 }
 

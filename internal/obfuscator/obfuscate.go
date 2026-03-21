@@ -6,17 +6,22 @@ func (o *Obfuscator) Obfuscate() error {
 		o.DeleteComments()
 	}
 
-	// Applying control flow flattening
-	if o.cfg.Obfuscator.ControlFlow.Enable {
-		o.controlFlow.Obfuscate()
-	}
-
-	// Renaming non-exported identifiers if flag is set
+	// Renaming non-exported identifiers BEFORE control flow flattening.
+	// CFF creates new AST nodes (hoisted var declarations) that are invisible
+	// to typesInfo, so renameIdentifiers must run first — while the AST still
+	// matches typesInfo exactly.
 	if o.cfg.Obfuscator.Identifiers.Enable {
 		err := o.renameIdentifiers.Obfuscate()
 		if err != nil {
 			return err
 		}
+	}
+
+	// Applying control flow flattening AFTER renaming.
+	// At this point all identifiers are already renamed consistently,
+	// so hoisted var names will match their usages.
+	if o.cfg.Obfuscator.ControlFlow.Enable {
+		o.controlFlow.Obfuscate()
 	}
 
 	// Obfuscating literals if flag is set by level from config

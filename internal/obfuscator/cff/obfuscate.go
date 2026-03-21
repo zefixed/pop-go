@@ -4,9 +4,13 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"go/types"
 	"log/slog"
 	"pop-go/pkg/util"
+	"strings"
 	"time"
+
+	"golang.org/x/tools/go/packages"
 )
 
 // Obfuscate executes the control flow flattening obfuscation process.
@@ -15,41 +19,68 @@ import (
 func (f *CFF) Obfuscate() {
 	f.log.Info(f.cfg.CurLocale["obf.info.start.cff"])
 	t := time.Now()
-
 	for _, pkg := range f.pkgs {
 		for _, file := range pkg.Syntax {
 			absPath := pkg.Fset.File(file.Pos()).Name()
 			f.log.Debug(f.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", absPath))
-
-			if err := f.flattenFile(file, pkg.Fset); err != nil {
+			if err := f.flattenFile(file, pkg); err != nil {
 				f.log.Error(f.cfg.CurLocale["obf.err.cff"], slog.String("file", absPath), slog.Any("error", err))
 				continue
 			}
 		}
 	}
-
 	f.log.Info(f.cfg.CurLocale["obf.info.end.cff"], slog.String("duration", time.Since(t).String()))
 }
 
 // flattenFile processes a Go AST file and applies control flow flattening
 // to eligible functions. Functions containing concurrency primitives (goroutines,
 // channels) are skipped to avoid synchronization issues.
-func (f *CFF) flattenFile(file *ast.File, fset *token.FileSet) error {
+func (f *CFF) flattenFile(file *ast.File, pkg *packages.Package) error {
+	// Build import alias map for THIS file only.
+	// Must be per-file because different files in the same package may import
+	// the same package under different aliases (or no alias at all). Using a
+	// package-wide map would cause CFF to emit the wrong qualifier in files
+	// that don't use the alias (e.g. stdhttp.Flusher in a file that imports
+	// "net/http" without an alias, causing "undefined: stdhttp").
+	filePkgAliases := make(map[string]string) // importPath → localName
+	for _, imp := range file.Imports {
+		importPath := strings.Trim(imp.Path.Value, `"`)
+		if imp.Name != nil && imp.Name.Name != "_" && imp.Name.Name != "." {
+			filePkgAliases[importPath] = imp.Name.Name
+		}
+	}
+
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Body == nil || len(fn.Body.List) < 2 {
 			continue
 		}
-
-		// Skip functions with concurrency primitives to prevent deadlocks
 		if f.hasConcurrency(fn.Body.List) {
 			f.log.Debug("skipping function with concurrency", slog.String("function", fn.Name.Name))
 			continue
 		}
+		if f.hasAnonymousStructTypeAssertion(fn.Body.List) {
+			f.log.Debug("skipping function with anonymous struct type assertion", slog.String("function", fn.Name.Name))
+			continue
+		}
+		if f.hasLocalConst(fn.Body.List) {
+			f.log.Debug("skipping function with local const declaration", slog.String("function", fn.Name.Name))
+			continue
+		}
+		if f.hasLocalTypeDecl(fn.Body.List) {
+			f.log.Debug("skipping function with local type declaration", slog.String("function", fn.Name.Name))
+			continue
+		}
+		if f.hasGoto(fn.Body.List) {
+			f.log.Debug("skipping function with goto statement", slog.String("function", fn.Name.Name))
+			continue
+		}
 
-		if err := f.flattenFunction(fn); err != nil {
+		imports := make(map[string]string)
+		if err := f.flattenFunction(fn, pkg, filePkgAliases, imports); err != nil {
 			return err
 		}
+		addImportsToFile(file, imports)
 	}
 	return nil
 }
@@ -146,145 +177,273 @@ type VarInfo struct {
 // converted into switch cases controlled by a state variable within a
 // for-loop dispatcher. Variable declarations are hoisted to function scope
 // to maintain visibility across case boundaries.
-func (f *CFF) flattenFunction(fn *ast.FuncDecl) error {
+func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliases map[string]string, imports map[string]string) error {
+	hoistedVars := make(map[string]bool)
 	stateVarName := util.GenerateUniqueName(f.cfg.Obfuscator.Seed)
 	originalStmts := fn.Body.List
+	typesInfo := pkg.TypesInfo
+	currentPkgPath := pkg.Types.Path() // Use full import path for accurate type comparison
 
-	// Phase 1: Collect variables with type information for hoisting
-	varInfoMap := make(map[string]*VarInfo)
-
-	// Register function parameters with their types (marked as IsParam=true)
-	if fn.Type.Params != nil {
-		for _, param := range fn.Type.Params.List {
-			for _, name := range param.Names {
-				varInfoMap[name.Name] = &VarInfo{
-					Name:    name.Name,
-					Type:    param.Type,
-					IsParam: true,
-				}
+	// Pre-build position → type map from typesInfo.Defs.
+	// Using token.Pos as key avoids pointer-equality issues that can cause
+	// typesInfo.Defs[ident] to miss entries (e.g. when AST nodes are reused
+	// or the map is keyed by a different pointer than the one we hold).
+	posToType := make(map[token.Pos]types.Type)
+	if typesInfo != nil && typesInfo.Defs != nil {
+		for defIdent, obj := range typesInfo.Defs {
+			if obj != nil && obj.Type() != nil {
+				posToType[defIdent.Pos()] = obj.Type()
 			}
 		}
 	}
 
-	// First pass: collect variables from short declarations (:=) and explicit var statements
-	for _, stmt := range originalStmts {
-		f.collectVarsWithTypes(stmt, varInfoMap)
+	// Build a map from original declaration position → current name in the AST.
+	// This is necessary because renameIdentifiers may have already run and
+	// renamed type names and struct field names in-place. typesInfo still
+	// holds the original names, so we must resolve current names from the AST
+	// to avoid generating hoisted declarations with stale (undefined) type names.
+	//
+	// IMPORTANT: skip idents with Pos() == token.NoPos (== 0). Synthetic idents
+	// created by CFF (state variable names) have no position. Built-in types like
+	// `error` also have obj.Pos() == 0, so if we stored a synthetic name at key 0,
+	// typeToAST would rename `error` to the state variable name.
+	currentNames := make(map[token.Pos]string)
+	for _, file := range pkg.Syntax {
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.TypeSpec:
+				if node.Name != nil && node.Name.Pos() != token.NoPos {
+					currentNames[node.Name.Pos()] = node.Name.Name
+				}
+			case *ast.Field:
+				for _, name := range node.Names {
+					if name.Pos() != token.NoPos {
+						currentNames[name.Pos()] = name.Name
+					}
+				}
+			case *ast.Ident:
+				if node.Pos() != token.NoPos {
+					currentNames[node.Pos()] = node.Name
+				}
+			}
+			return true
+		})
 	}
 
-	// Second pass: refine variable types using already collected information
-	for _, stmt := range originalStmts {
-		f.resolveVarTypes(stmt, varInfoMap)
+	// Build a map from import path → local alias used in this package's files.
+	// When a package is imported with an alias (e.g. stdhttp "net/http"), typeToAST
+	// must use that alias rather than the canonical pkg.Name(), otherwise the generated
+	// hoisted var declaration would reference an undefined identifier.
+	// NOTE: pkgAliases is now passed in from flattenFile (per-file) to avoid applying
+	// an alias from one file to all other files in the same package.
+
+	varInfoMap := make(map[string]*VarInfo)
+
+	if fn.Type.Params != nil {
+		for _, param := range fn.Type.Params.List {
+			for _, name := range param.Names {
+				varInfoMap[name.Name] = &VarInfo{Name: name.Name, Type: param.Type, IsParam: true}
+			}
+		}
 	}
 
-	// Phase 2: Generate hoisted variable declarations (excluding parameters)
+	for _, stmt := range originalStmts {
+		f.collectVarsWithTypes(stmt, varInfoMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
+	}
+	for _, stmt := range originalStmts {
+		f.resolveVarTypes(stmt, varInfoMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
+	}
+
 	var hoistedDecls []ast.Stmt
-	for _, varInfo := range varInfoMap {
-		if varInfo.IsParam {
+	for _, v := range varInfoMap {
+		if v.IsParam {
 			continue
 		}
-
-		varDecl := &ast.DeclStmt{
+		// Skip blank identifier — it cannot be declared as a named variable
+		// and any import added for its type would be flagged as unused.
+		if v.Name == "_" {
+			continue
+		}
+		hoistedVars[v.Name] = true
+		hoistedDecls = append(hoistedDecls, &ast.DeclStmt{
 			Decl: &ast.GenDecl{
 				Tok: token.VAR,
 				Specs: []ast.Spec{
-					&ast.ValueSpec{
-						Names: []*ast.Ident{{Name: varInfo.Name}},
-						Type:  varInfo.Type,
-					},
+					&ast.ValueSpec{Names: []*ast.Ident{{Name: v.Name}}, Type: v.Type},
 				},
 			},
-		}
-		hoistedDecls = append(hoistedDecls, varDecl)
+		})
 	}
 
-	// Phase 3: Build the state machine dispatcher (switch inside for-loop)
-	var caseClauses []ast.Stmt
+	var cases []ast.Stmt
 	n := len(originalStmts)
+	// Build a zero-value return statement for use as the terminal transition.
+	// A plain `return` without values is only valid for void functions.
+	// For functions with return types we must return zero values to satisfy the compiler.
+	// (This return is always unreachable in practice — it only follows the last real
+	// statement which is itself a return — but the compiler still type-checks it.)
+	terminalReturn := f.buildZeroReturn(fn.Type.Results, currentPkgPath, currentNames, pkgAliases, imports)
 
 	for i, stmt := range originalStmts {
-		// Convert short declarations (:=) to assignments (=) for hoisted variables
-		processedStmt := f.convertDefineToAssign(stmt)
-
-		// Determine transition: either next state or break for final statement
-		var transition ast.Stmt
+		processed := f.convertDefineToAssign(stmt, hoistedVars)
+		var trans ast.Stmt
 		if i == n-1 {
-			transition = &ast.BranchStmt{Tok: token.BREAK}
+			trans = terminalReturn
 		} else {
-			transition = &ast.AssignStmt{
+			trans = &ast.AssignStmt{
 				Tok: token.ASSIGN,
 				Lhs: []ast.Expr{&ast.Ident{Name: stateVarName}},
 				Rhs: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("%d", i+1)}},
 			}
 		}
-
-		// Assemble case body: processed statement + state transition
-		caseBody := []ast.Stmt{processedStmt, transition}
-
-		caseBlock := &ast.BlockStmt{
-			List: caseBody,
-		}
-
-		caseClause := &ast.CaseClause{
+		cases = append(cases, &ast.CaseClause{
 			List: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("%d", i)}},
-			Body: []ast.Stmt{caseBlock},
-		}
-		caseClauses = append(caseClauses, caseClause)
+			Body: []ast.Stmt{&ast.BlockStmt{List: []ast.Stmt{processed, trans}}},
+		})
 	}
+	cases = append(cases, &ast.CaseClause{Body: []ast.Stmt{terminalReturn}})
 
-	// Add default case as safety fallback to exit the dispatcher loop
-	defaultCase := &ast.CaseClause{
-		Body: []ast.Stmt{&ast.BranchStmt{Tok: token.BREAK}},
-	}
-	caseClauses = append(caseClauses, defaultCase)
-
-	// Phase 4: Assemble the new function body
-	finalBody := []ast.Stmt{}
-	finalBody = append(finalBody, hoistedDecls...)
-
-	// Initialize state variable: state := 0
-	stateInit := &ast.AssignStmt{
+	finalBody := append(hoistedDecls, &ast.AssignStmt{
 		Tok: token.DEFINE,
 		Lhs: []ast.Expr{&ast.Ident{Name: stateVarName}},
 		Rhs: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: "0"}},
-	}
-	finalBody = append(finalBody, stateInit)
-
-	// Create the dispatcher: for { switch state { ... } }
-	dispatcherLoop := &ast.ForStmt{
-		Body: &ast.BlockStmt{
-			List: []ast.Stmt{
-				&ast.SwitchStmt{
-					Tag: &ast.Ident{Name: stateVarName},
-					Body: &ast.BlockStmt{
-						List: caseClauses,
-					},
-				},
-			},
-		},
-	}
-	finalBody = append(finalBody, dispatcherLoop)
-
-	// Replace the original function body with the flattened version
+	})
+	finalBody = append(finalBody, &ast.ForStmt{
+		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.SwitchStmt{
+			Tag:  &ast.Ident{Name: stateVarName},
+			Body: &ast.BlockStmt{List: cases},
+		}}},
+	})
 	fn.Body.List = finalBody
-
 	return nil
 }
 
 // collectVarsWithTypes recursively traverses statements to collect variables
 // declared with short declaration syntax (:=). Infers types from RHS expressions
 // and stores them in varMap for later hoisting. Handles nested blocks, if/for/range.
-func (f *CFF) collectVarsWithTypes(stmt ast.Stmt, varMap map[string]*VarInfo) {
+func (f *CFF) collectVarsWithTypes(stmt ast.Stmt, varMap map[string]*VarInfo, typesInfo *types.Info, posToType map[token.Pos]types.Type, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) {
 	switch s := stmt.(type) {
 	case *ast.AssignStmt:
 		if s.Tok == token.DEFINE {
 			for i, lhs := range s.Lhs {
 				if ident, ok := lhs.(*ast.Ident); ok {
+					// Skip blank identifier — it can't be hoisted as a named var
+					if ident.Name == "_" {
+						continue
+					}
 					if _, exists := varMap[ident.Name]; !exists {
-						varType := f.inferTypeFromExpr(s.Rhs[i], varMap)
-						varMap[ident.Name] = &VarInfo{
-							Name:    ident.Name,
-							Type:    varType,
-							IsParam: false,
+						var varType ast.Expr
+
+						// Most reliable: look up by token position (avoids pointer-equality
+						// issues with typesInfo.Defs[ident] direct lookup).
+						if typ, found := posToType[ident.Pos()]; found && typ != nil {
+							// For types that contain anonymous structs, typeToAST reconstructs
+							// field names from *types.Struct which may not match the renamed names
+							// in the current AST (multiple anonymous structs with the same shape
+							// get different renamed field names). Use inferTypeFromExpr instead,
+							// which reads the type directly from the RHS AST node.
+							if containsAnonymousStruct(typ) {
+								rhsIdx := i
+								if rhsIdx >= len(s.Rhs) {
+									rhsIdx = len(s.Rhs) - 1
+								}
+								if rhsIdx >= 0 {
+									varType = f.inferTypeFromExpr(s.Rhs[rhsIdx], varMap, typesInfo, currentPkgPath, currentNames, pkgAliases, imports)
+									varMap[ident.Name] = &VarInfo{Name: ident.Name, Type: varType, IsParam: false}
+									continue
+								}
+							}
+							varType = f.typeToAST(typ, currentPkgPath, currentNames, pkgAliases, imports)
+							varMap[ident.Name] = &VarInfo{Name: ident.Name, Type: varType, IsParam: false}
+							continue
+						}
+
+						// Fallback: direct Defs lookup
+						if typesInfo != nil {
+							if obj := typesInfo.Defs[ident]; obj != nil && obj.Type() != nil {
+								if containsAnonymousStruct(obj.Type()) {
+									rhsIdx := i
+									if rhsIdx >= len(s.Rhs) {
+										rhsIdx = len(s.Rhs) - 1
+									}
+									if rhsIdx >= 0 {
+										varType = f.inferTypeFromExpr(s.Rhs[rhsIdx], varMap, typesInfo, currentPkgPath, currentNames, pkgAliases, imports)
+										varMap[ident.Name] = &VarInfo{Name: ident.Name, Type: varType, IsParam: false}
+										continue
+									}
+								}
+								varType = f.typeToAST(obj.Type(), currentPkgPath, currentNames, pkgAliases, imports)
+								varMap[ident.Name] = &VarInfo{Name: ident.Name, Type: varType, IsParam: false}
+								continue
+							}
+						}
+
+						// Check if RHS is a type assertion: x, ok := expr.(T)
+						if i < len(s.Rhs) {
+							if ta, ok := s.Rhs[i].(*ast.TypeAssertExpr); ok && ta.Type != nil {
+								if i == 0 {
+									varType = ta.Type
+								} else {
+									varType = &ast.Ident{Name: "bool"}
+								}
+								varMap[ident.Name] = &VarInfo{Name: ident.Name, Type: varType, IsParam: false}
+								continue
+							}
+						}
+
+						// For multi-value function returns, use types.Info to get correct types per index
+						if len(s.Lhs) > 1 && len(s.Rhs) == 1 && typesInfo != nil {
+							if tv, ok := typesInfo.Types[s.Rhs[0]]; ok && tv.Type != nil {
+								if tuple, ok := tv.Type.(*types.Tuple); ok && tuple.Len() == len(s.Lhs) {
+									varType = f.typeToAST(tuple.At(i).Type(), currentPkgPath, currentNames, pkgAliases, imports)
+									varMap[ident.Name] = &VarInfo{Name: ident.Name, Type: varType, IsParam: false}
+									continue
+								}
+							}
+							if callExpr, ok := s.Rhs[0].(*ast.CallExpr); ok {
+								if funTV, ok := typesInfo.Types[callExpr.Fun]; ok && funTV.Type != nil {
+									if sig, ok := funTV.Type.(*types.Signature); ok {
+										results := sig.Results()
+										if results != nil && results.Len() == len(s.Lhs) {
+											varType = f.typeToAST(results.At(i).Type(), currentPkgPath, currentNames, pkgAliases, imports)
+											varMap[ident.Name] = &VarInfo{Name: ident.Name, Type: varType, IsParam: false}
+											continue
+										}
+									}
+								}
+							}
+						}
+
+						// Fallback: infer type from the corresponding RHS expression
+						rhsIdx := i
+						if rhsIdx >= len(s.Rhs) {
+							rhsIdx = len(s.Rhs) - 1
+						}
+						if rhsIdx < 0 {
+							continue
+						}
+						varType = f.inferTypeFromExpr(s.Rhs[rhsIdx], varMap, typesInfo, currentPkgPath, currentNames, pkgAliases, imports)
+						varMap[ident.Name] = &VarInfo{Name: ident.Name, Type: varType, IsParam: false}
+					}
+				}
+			}
+		}
+	case *ast.DeclStmt:
+		if gen, ok := s.Decl.(*ast.GenDecl); ok && gen.Tok == token.VAR {
+			for _, spec := range gen.Specs {
+				if valueSpec, ok := spec.(*ast.ValueSpec); ok {
+					for _, name := range valueSpec.Names {
+						if _, exists := varMap[name.Name]; !exists {
+							varType := valueSpec.Type
+							if varType == nil && len(valueSpec.Values) > 0 && typesInfo != nil {
+								if tv, ok := typesInfo.Types[valueSpec.Values[0]]; ok && tv.Type != nil {
+									varType = f.typeToAST(tv.Type, currentPkgPath, currentNames, pkgAliases, imports)
+								}
+							}
+							if varType == nil {
+								varType = &ast.Ident{Name: "interface{}"}
+							}
+							varMap[name.Name] = &VarInfo{Name: name.Name, Type: varType, IsParam: false}
 						}
 					}
 				}
@@ -292,93 +451,170 @@ func (f *CFF) collectVarsWithTypes(stmt ast.Stmt, varMap map[string]*VarInfo) {
 		}
 	case *ast.BlockStmt:
 		for _, inner := range s.List {
-			f.collectVarsWithTypes(inner, varMap)
+			f.collectVarsWithTypes(inner, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 		}
 	case *ast.IfStmt:
 		if s.Init != nil {
-			f.collectVarsWithTypes(s.Init, varMap)
+			f.collectVarsWithTypes(s.Init, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 		}
-		f.collectVarsWithTypes(s.Body, varMap)
+		f.collectVarsWithTypes(s.Body, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 		if s.Else != nil {
 			if elseBlock, ok := s.Else.(*ast.BlockStmt); ok {
-				f.collectVarsWithTypes(elseBlock, varMap)
+				f.collectVarsWithTypes(elseBlock, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 			}
 		}
 	case *ast.ForStmt:
 		if s.Init != nil {
-			f.collectVarsWithTypes(s.Init, varMap)
+			if assign, ok := s.Init.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE {
+			} else {
+				f.collectVarsWithTypes(s.Init, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
+			}
 		}
-		f.collectVarsWithTypes(s.Body, varMap)
+		f.collectVarsWithTypes(s.Body, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 	case *ast.RangeStmt:
-		if s.Key != nil {
-			if ident, ok := s.Key.(*ast.Ident); ok && s.Tok == token.DEFINE {
-				if _, exists := varMap[ident.Name]; !exists {
-					varMap[ident.Name] = &VarInfo{
-						Name:    ident.Name,
-						Type:    f.inferTypeFromRangeKey(s.X, varMap),
-						IsParam: false,
-					}
-				}
+		if s.Body != nil {
+			for _, inner := range s.Body.List {
+				f.collectVarsWithTypes(inner, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 			}
 		}
-		if s.Value != nil {
-			if ident, ok := s.Value.(*ast.Ident); ok && s.Tok == token.DEFINE {
-				if _, exists := varMap[ident.Name]; !exists {
-					varMap[ident.Name] = &VarInfo{
-						Name:    ident.Name,
-						Type:    f.inferTypeFromRangeValue(s.X, varMap),
-						IsParam: false,
-					}
-				}
-			}
-		}
-		f.collectVarsWithTypes(s.Body, varMap)
 	}
 }
 
 // resolveVarTypes performs a second pass to refine variable types using
 // already collected information from varMap. This handles cases where
 // a variable's type depends on another variable declared earlier.
-func (f *CFF) resolveVarTypes(stmt ast.Stmt, varMap map[string]*VarInfo) {
+func (f *CFF) resolveVarTypes(stmt ast.Stmt, varMap map[string]*VarInfo, typesInfo *types.Info, posToType map[token.Pos]types.Type, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) {
 	switch s := stmt.(type) {
 	case *ast.AssignStmt:
 		if s.Tok == token.DEFINE {
 			for i, lhs := range s.Lhs {
 				if ident, ok := lhs.(*ast.Ident); ok {
+					// Skip blank identifier
+					if ident.Name == "_" {
+						continue
+					}
 					if info, exists := varMap[ident.Name]; exists {
-						newType := f.inferTypeFromExpr(s.Rhs[i], varMap)
-						info.Type = newType
+						// Most reliable: look up by token position.
+						if typ, found := posToType[ident.Pos()]; found && typ != nil {
+							if containsAnonymousStruct(typ) {
+								rhsIdx := i
+								if rhsIdx >= len(s.Rhs) {
+									rhsIdx = len(s.Rhs) - 1
+								}
+								if rhsIdx >= 0 {
+									info.Type = f.inferTypeFromExpr(s.Rhs[rhsIdx], varMap, typesInfo, currentPkgPath, currentNames, pkgAliases, imports)
+									continue
+								}
+							}
+							info.Type = f.typeToAST(typ, currentPkgPath, currentNames, pkgAliases, imports)
+							continue
+						}
+
+						// Fallback: direct Defs lookup
+						if typesInfo != nil {
+							if obj := typesInfo.Defs[ident]; obj != nil && obj.Type() != nil {
+								if containsAnonymousStruct(obj.Type()) {
+									rhsIdx := i
+									if rhsIdx >= len(s.Rhs) {
+										rhsIdx = len(s.Rhs) - 1
+									}
+									if rhsIdx >= 0 {
+										info.Type = f.inferTypeFromExpr(s.Rhs[rhsIdx], varMap, typesInfo, currentPkgPath, currentNames, pkgAliases, imports)
+										continue
+									}
+								}
+								info.Type = f.typeToAST(obj.Type(), currentPkgPath, currentNames, pkgAliases, imports)
+								continue
+							}
+						}
+
+						// Check if RHS is a type assertion: x, ok := expr.(T)
+						if i < len(s.Rhs) {
+							if ta, ok := s.Rhs[i].(*ast.TypeAssertExpr); ok && ta.Type != nil {
+								if i == 0 {
+									info.Type = ta.Type
+								} else {
+									info.Type = &ast.Ident{Name: "bool"}
+								}
+								continue
+							}
+						}
+
+						// For multi-value function returns, use types.Info to get correct types per index
+						if len(s.Lhs) > 1 && len(s.Rhs) == 1 && typesInfo != nil {
+							if tv, ok := typesInfo.Types[s.Rhs[0]]; ok && tv.Type != nil {
+								if tuple, ok := tv.Type.(*types.Tuple); ok && tuple.Len() == len(s.Lhs) {
+									info.Type = f.typeToAST(tuple.At(i).Type(), currentPkgPath, currentNames, pkgAliases, imports)
+									continue
+								}
+							}
+							if callExpr, ok := s.Rhs[0].(*ast.CallExpr); ok {
+								if funTV, ok := typesInfo.Types[callExpr.Fun]; ok && funTV.Type != nil {
+									if sig, ok := funTV.Type.(*types.Signature); ok {
+										results := sig.Results()
+										if results != nil && results.Len() == len(s.Lhs) {
+											info.Type = f.typeToAST(results.At(i).Type(), currentPkgPath, currentNames, pkgAliases, imports)
+											continue
+										}
+									}
+								}
+							}
+						}
+
+						// For multi-value: all reliable sources exhausted, never call
+						// inferTypeFromExpr (it can't distinguish per-index return types
+						// and would overwrite a correctly resolved type with interface{}).
+						if len(s.Lhs) > 1 && len(s.Rhs) == 1 {
+							continue
+						}
+						rhsIdx := i
+						if rhsIdx >= len(s.Rhs) {
+							rhsIdx = len(s.Rhs) - 1
+						}
+						if rhsIdx < 0 {
+							continue
+						}
+						newType := f.inferTypeFromExpr(s.Rhs[rhsIdx], varMap, typesInfo, currentPkgPath, currentNames, pkgAliases, imports)
+						// Only update if we got something concrete, never degrade to interface{}.
+						if !isInterfaceAny(newType) || isInterfaceAny(info.Type) {
+							info.Type = newType
+						}
 					}
 				}
 			}
 		}
 	case *ast.BlockStmt:
 		for _, inner := range s.List {
-			f.resolveVarTypes(inner, varMap)
+			f.resolveVarTypes(inner, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 		}
 	case *ast.IfStmt:
 		if s.Init != nil {
-			f.resolveVarTypes(s.Init, varMap)
+			f.resolveVarTypes(s.Init, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 		}
-		f.resolveVarTypes(s.Body, varMap)
+		f.resolveVarTypes(s.Body, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 		if s.Else != nil {
 			if elseBlock, ok := s.Else.(*ast.BlockStmt); ok {
-				f.resolveVarTypes(elseBlock, varMap)
+				f.resolveVarTypes(elseBlock, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 			}
 		}
 	case *ast.ForStmt:
 		if s.Init != nil {
-			f.resolveVarTypes(s.Init, varMap)
+			f.resolveVarTypes(s.Init, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 		}
-		f.resolveVarTypes(s.Body, varMap)
+		f.resolveVarTypes(s.Body, varMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 	}
 }
 
-// inferTypeFromExpr infers the Go type of an expression by pattern matching
+// inferTypeFromExpr infers the Go type of expression by pattern matching
 // on AST node types. Handles literals, identifiers (with varMap lookup),
 // function calls (make, chan), channel operations, and composite types.
 // Returns interface{} as fallback for unknown types.
-func (f *CFF) inferTypeFromExpr(expr ast.Expr, varMap map[string]*VarInfo) ast.Expr {
+func (f *CFF) inferTypeFromExpr(expr ast.Expr, varMap map[string]*VarInfo, typesInfo *types.Info, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) ast.Expr {
+	if typesInfo != nil {
+		if tv, ok := typesInfo.Types[expr]; ok && tv.Type != nil {
+			return f.typeToAST(tv.Type, currentPkgPath, currentNames, pkgAliases, imports)
+		}
+	}
 	switch e := expr.(type) {
 	case *ast.BasicLit:
 		switch e.Kind {
@@ -392,50 +628,32 @@ func (f *CFF) inferTypeFromExpr(expr ast.Expr, varMap map[string]*VarInfo) ast.E
 			return &ast.Ident{Name: "byte"}
 		}
 	case *ast.Ident:
-		// Lookup type from collected variable information
 		if info, exists := varMap[e.Name]; exists {
 			return info.Type
 		}
 		return &ast.Ident{Name: "string"}
 	case *ast.CallExpr:
-		if ident, ok := e.Fun.(*ast.Ident); ok {
-			switch ident.Name {
-			case "make":
-				// Handle make(chan T) -> chan T
-				if len(e.Args) > 0 {
-					argType := f.inferTypeFromExpr(e.Args[0], varMap)
-					if chanType, ok := argType.(*ast.ChanType); ok {
-						return chanType
-					}
-					return &ast.ChanType{Value: argType}
-				}
-			case "chan":
-				if len(e.Args) > 0 {
-					return &ast.ChanType{Value: f.inferTypeFromExpr(e.Args[0], varMap)}
-				}
+		if typesInfo != nil {
+			if tv, ok := typesInfo.Types[e]; ok && tv.Type != nil {
+				return f.typeToAST(tv.Type, currentPkgPath, currentNames, pkgAliases, imports)
 			}
 		}
-		return &ast.Ident{Name: "string"}
+		return &ast.Ident{Name: "interface{}"}
 	case *ast.UnaryExpr:
-		// Handle address-of: &Struct{} -> *Struct
 		if e.Op == token.AND {
 			if comp, ok := e.X.(*ast.CompositeLit); ok {
 				return &ast.StarExpr{X: comp.Type}
 			}
 		}
-		// Handle receive: <-ch -> element type of channel
 		if e.Op == token.ARROW {
-			chanType := f.inferTypeFromExpr(e.X, varMap)
+			chanType := f.inferTypeFromExpr(e.X, varMap, typesInfo, currentPkgPath, currentNames, pkgAliases, imports)
 			if ct, ok := chanType.(*ast.ChanType); ok {
 				return ct.Value
 			}
 		}
 	case *ast.CompositeLit:
 		return e.Type
-	case *ast.BinaryExpr:
-		return f.inferTypeFromExpr(e.X, varMap)
 	case *ast.ArrayType:
-		// ArrayType with Len==nil represents a slice
 		if e.Len == nil {
 			return &ast.ArrayType{Len: nil, Elt: e.Elt}
 		}
@@ -448,7 +666,7 @@ func (f *CFF) inferTypeFromExpr(expr ast.Expr, varMap map[string]*VarInfo) ast.E
 	return &ast.Ident{Name: "interface{}"}
 }
 
-// inferTypeFromRangeKey infers the type of a range loop's key variable.
+// inferTypeFromRangeKey infers the type of range loop's key variable.
 // For slices/arrays/maps, the key is typically int (index).
 func (f *CFF) inferTypeFromRangeKey(expr ast.Expr, varMap map[string]*VarInfo) ast.Expr {
 	switch expr.(type) {
@@ -460,7 +678,7 @@ func (f *CFF) inferTypeFromRangeKey(expr ast.Expr, varMap map[string]*VarInfo) a
 	return &ast.Ident{Name: "interface{}"}
 }
 
-// inferTypeFromRangeValue infers the type of a range loop's value variable.
+// inferTypeFromRangeValue infers the type of range loop's value variable.
 // Looks up the container type in varMap and extracts the element type.
 func (f *CFF) inferTypeFromRangeValue(expr ast.Expr, varMap map[string]*VarInfo) ast.Expr {
 	switch e := expr.(type) {
@@ -491,47 +709,477 @@ func (f *CFF) getElementType(expr ast.Expr) ast.Expr {
 // (:=) to assignments (=) in preparation for hoisting. This ensures
 // variables declared in one case remain accessible in subsequent cases.
 // Handles nested blocks, if/for/range statements recursively.
-func (f *CFF) convertDefineToAssign(stmt ast.Stmt) ast.Stmt {
+func (f *CFF) convertDefineToAssign(stmt ast.Stmt, hoistedVars map[string]bool) ast.Stmt {
+	isAnonymousStructAssertion := func(expr ast.Expr) bool {
+		if ta, ok := expr.(*ast.TypeAssertExpr); ok && ta.Type != nil {
+			_, isStruct := ta.Type.(*ast.StructType)
+			return isStruct
+		}
+		return false
+	}
+
 	switch s := stmt.(type) {
+	case *ast.DeclStmt:
+		if gen, ok := s.Decl.(*ast.GenDecl); ok && gen.Tok == token.VAR {
+			var assigns []ast.Stmt
+			for _, spec := range gen.Specs {
+				if vs, ok := spec.(*ast.ValueSpec); ok {
+					// If there are no values, the declaration is pure type annotation
+					// (e.g. "var x int"). If all names are hoisted, we already emitted
+					// "var x int" at the top — no assignment needed, skip entirely.
+					if len(vs.Values) == 0 {
+						allHoisted := true
+						for _, name := range vs.Names {
+							if !hoistedVars[name.Name] {
+								allHoisted = false
+								break
+							}
+						}
+						if allHoisted {
+							continue
+						}
+					}
+					// If there ARE values (e.g. "var bestSpeed = speed"), always emit
+					// the assignment — even if the variable is hoisted we still need to
+					// run the initializer expression.
+					if len(vs.Values) > 0 {
+						assigns = append(assigns, &ast.AssignStmt{
+							Lhs: toExprs(vs.Names), Tok: token.ASSIGN, TokPos: gen.TokPos, Rhs: vs.Values,
+						})
+					}
+				}
+			}
+			if len(assigns) == 1 {
+				return assigns[0]
+			}
+			if len(assigns) > 1 {
+				return &ast.BlockStmt{List: assigns}
+			}
+			return &ast.EmptyStmt{}
+		}
 	case *ast.AssignStmt:
 		if s.Tok == token.DEFINE {
-			newStmt := &ast.AssignStmt{
-				Lhs:    s.Lhs,
-				Tok:    token.ASSIGN,
-				TokPos: s.TokPos,
-				Rhs:    s.Rhs,
+			// Preserve := for type assertions to anonymous structs
+			for _, rhs := range s.Rhs {
+				if isAnonymousStructAssertion(rhs) {
+					return stmt
+				}
 			}
-			return newStmt
+			return &ast.AssignStmt{Lhs: s.Lhs, Tok: token.ASSIGN, TokPos: s.TokPos, Rhs: s.Rhs}
 		}
 	case *ast.BlockStmt:
-		newList := make([]ast.Stmt, len(s.List))
+		res := make([]ast.Stmt, len(s.List))
 		for i, inner := range s.List {
-			newList[i] = f.convertDefineToAssign(inner)
+			res[i] = f.convertDefineToAssign(inner, hoistedVars)
 		}
-		return &ast.BlockStmt{List: newList}
+		return &ast.BlockStmt{List: res}
 	case *ast.IfStmt:
 		if s.Init != nil {
-			s.Init = f.convertDefineToAssign(s.Init)
+			s.Init = f.convertDefineToAssign(s.Init, hoistedVars)
 		}
-		s.Body = f.convertDefineToAssign(s.Body).(*ast.BlockStmt)
+		s.Body = f.convertDefineToAssign(s.Body, hoistedVars).(*ast.BlockStmt)
 		if s.Else != nil {
-			if elseBlock, ok := s.Else.(*ast.BlockStmt); ok {
-				s.Else = f.convertDefineToAssign(elseBlock)
+			if eb, ok := s.Else.(*ast.BlockStmt); ok {
+				s.Else = f.convertDefineToAssign(eb, hoistedVars)
 			}
 		}
 		return s
 	case *ast.ForStmt:
-		if s.Init != nil {
-			s.Init = f.convertDefineToAssign(s.Init)
-		}
-		s.Body = f.convertDefineToAssign(s.Body).(*ast.BlockStmt)
+		s.Body = f.convertDefineToAssign(s.Body, hoistedVars).(*ast.BlockStmt)
 		return s
 	case *ast.RangeStmt:
-		if s.Tok == token.DEFINE {
-			s.Tok = token.ASSIGN
+		// Preserve := in range loops
+		if s.Body != nil {
+			s.Body = f.convertDefineToAssign(s.Body, hoistedVars).(*ast.BlockStmt)
 		}
-		s.Body = f.convertDefineToAssign(s.Body).(*ast.BlockStmt)
 		return s
 	}
 	return stmt
+}
+
+func toExprs(idents []*ast.Ident) []ast.Expr {
+	exprs := make([]ast.Expr, len(idents))
+	for i, id := range idents {
+		exprs[i] = id
+	}
+	return exprs
+}
+
+// buildZeroReturn constructs a return statement with zero values for each
+// result type in the function signature. For void functions returns `return`.
+// This is needed as the terminal transition in the CFF state machine because
+// a plain `return` without values is invalid in non-void functions.
+func (f *CFF) buildZeroReturn(results *ast.FieldList, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) *ast.ReturnStmt {
+	if results == nil || len(results.List) == 0 {
+		return &ast.ReturnStmt{}
+	}
+	var retVals []ast.Expr
+	for _, field := range results.List {
+		count := len(field.Names)
+		if count == 0 {
+			count = 1
+		}
+		for j := 0; j < count; j++ {
+			retVals = append(retVals, zeroValueForType(field.Type))
+		}
+	}
+	return &ast.ReturnStmt{Results: retVals}
+}
+
+// zeroValueForType returns an AST expression for the zero value of the given
+// type expression. Used to build valid return statements in non-void functions.
+func zeroValueForType(t ast.Expr) ast.Expr {
+	switch typ := t.(type) {
+	case *ast.Ident:
+		switch typ.Name {
+		case "bool":
+			return &ast.Ident{Name: "false"}
+		case "string":
+			return &ast.BasicLit{Kind: token.STRING, Value: `""`}
+		case "int", "int8", "int16", "int32", "int64",
+			"uint", "uint8", "uint16", "uint32", "uint64",
+			"uintptr", "byte", "rune", "float32", "float64",
+			"complex64", "complex128":
+			return &ast.BasicLit{Kind: token.INT, Value: "0"}
+		default:
+			// Named type — return zero composite literal: TypeName{}
+			return &ast.CompositeLit{Type: t}
+		}
+	case *ast.StarExpr:
+		return &ast.Ident{Name: "nil"}
+	case *ast.ArrayType, *ast.MapType, *ast.ChanType, *ast.FuncType:
+		return &ast.Ident{Name: "nil"}
+	case *ast.InterfaceType:
+		return &ast.Ident{Name: "nil"}
+	case *ast.SelectorExpr:
+		// Qualified type from another package (e.g. time.Duration, http.Handler)
+		return &ast.CompositeLit{Type: t}
+	case *ast.StructType:
+		return &ast.CompositeLit{Type: t}
+	}
+	return &ast.Ident{Name: "nil"}
+}
+
+func (f *CFF) typeToAST(t types.Type, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) ast.Expr {
+	switch typ := t.(type) {
+	case *types.Basic:
+		switch typ.Kind() {
+		case types.String:
+			return &ast.Ident{Name: "string"}
+		case types.Int:
+			return &ast.Ident{Name: "int"}
+		case types.Int8:
+			return &ast.Ident{Name: "int8"}
+		case types.Int16:
+			return &ast.Ident{Name: "int16"}
+		case types.Int64:
+			return &ast.Ident{Name: "int64"}
+		case types.Int32:
+			return &ast.Ident{Name: "rune"}
+		case types.Uint:
+			return &ast.Ident{Name: "uint"}
+		case types.Uint16:
+			return &ast.Ident{Name: "uint16"}
+		case types.Uint32:
+			return &ast.Ident{Name: "uint32"}
+		case types.Uint64:
+			return &ast.Ident{Name: "uint64"}
+		case types.Uintptr:
+			return &ast.Ident{Name: "uintptr"}
+		case types.Uint8:
+			return &ast.Ident{Name: "byte"}
+		case types.Float32, types.Float64:
+			return &ast.Ident{Name: "float64"}
+		case types.Bool:
+			return &ast.Ident{Name: "bool"}
+		case types.UnsafePointer:
+			return &ast.Ident{Name: "unsafe.Pointer"}
+		default:
+			return &ast.Ident{Name: "interface{}"}
+		}
+	case *types.Pointer:
+		return &ast.StarExpr{X: f.typeToAST(typ.Elem(), currentPkgPath, currentNames, pkgAliases, imports)}
+	case *types.Slice:
+		elem := f.typeToAST(typ.Elem(), currentPkgPath, currentNames, pkgAliases, imports)
+		if basic, ok := typ.Elem().(*types.Basic); ok && basic.Kind() == types.Uint8 {
+			return &ast.ArrayType{Len: nil, Elt: &ast.Ident{Name: "byte"}}
+		}
+		return &ast.ArrayType{Len: nil, Elt: elem}
+	case *types.Array:
+		return &ast.ArrayType{
+			Len: &ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("%d", typ.Len())},
+			Elt: f.typeToAST(typ.Elem(), currentPkgPath, currentNames, pkgAliases, imports),
+		}
+	case *types.Chan:
+		return &ast.ChanType{Value: f.typeToAST(typ.Elem(), currentPkgPath, currentNames, pkgAliases, imports)}
+	case *types.Map:
+		return &ast.MapType{
+			Key:   f.typeToAST(typ.Key(), currentPkgPath, currentNames, pkgAliases, imports),
+			Value: f.typeToAST(typ.Elem(), currentPkgPath, currentNames, pkgAliases, imports),
+		}
+	case *types.Alias:
+		// Go 1.22+ represents explicit type aliases as *types.Alias.
+		// types.Unalias returns the *types.Named (or other) that the alias points to,
+		// preserving the named type identity (e.g. os.FileInfo, not the underlying interface).
+		rhs := types.Unalias(typ)
+		return f.typeToAST(rhs, currentPkgPath, currentNames, pkgAliases, imports)
+	case *types.Named:
+		obj := typ.Obj()
+		pkg := obj.Pkg()
+		// Use current (post-rename) name from AST; fall back to original from type checker.
+		// Guard against NoPos (== 0): built-in types (error, comparable, etc.) and
+		// synthetic CFF idents both have Pos() == 0 — looking up currentNames[0] would
+		// return the last synthetic state-variable name, corrupting the type.
+		typeName := obj.Name()
+		if obj.Pos() != token.NoPos {
+			if currentName, ok := currentNames[obj.Pos()]; ok {
+				typeName = currentName
+			}
+		}
+		if pkg != nil && pkg.Path() == currentPkgPath {
+			return &ast.Ident{Name: typeName}
+		}
+		if pkg != nil {
+			// Use the local alias if the package was imported with one (e.g. stdhttp "net/http").
+			localName := pkg.Name()
+			if alias, ok := pkgAliases[pkg.Path()]; ok {
+				localName = alias
+			}
+			if imports != nil {
+				imports[localName] = pkg.Path()
+			}
+			return &ast.SelectorExpr{
+				X:   &ast.Ident{Name: localName},
+				Sel: &ast.Ident{Name: typeName},
+			}
+		}
+		return &ast.Ident{Name: typeName}
+	case *types.Signature:
+		return f.signatureToAST(typ, currentPkgPath, currentNames, pkgAliases, imports)
+	case *types.Struct:
+		// Build an anonymous struct AST node with current (post-rename) field names.
+		fields := &ast.FieldList{}
+		for i := 0; i < typ.NumFields(); i++ {
+			field := typ.Field(i)
+			fieldName := field.Name()
+			if field.Pos() != token.NoPos {
+				if currentName, ok := currentNames[field.Pos()]; ok {
+					fieldName = currentName
+				}
+			}
+			fields.List = append(fields.List, &ast.Field{
+				Names: []*ast.Ident{{Name: fieldName}},
+				Type:  f.typeToAST(field.Type(), currentPkgPath, currentNames, pkgAliases, imports),
+			})
+		}
+		return &ast.StructType{Fields: fields}
+	case *types.Interface:
+		return &ast.Ident{Name: "interface{}"}
+	case *types.Tuple:
+		if typ.Len() > 0 {
+			return f.typeToAST(typ.At(0).Type(), currentPkgPath, currentNames, pkgAliases, imports)
+		}
+		return &ast.Ident{Name: "interface{}"}
+	}
+	return &ast.Ident{Name: "interface{}"}
+}
+
+func (f *CFF) signatureToAST(sig *types.Signature, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) *ast.FuncType {
+	params := &ast.FieldList{}
+	if sig.Params() != nil {
+		for i := 0; i < sig.Params().Len(); i++ {
+			param := sig.Params().At(i)
+			params.List = append(params.List, &ast.Field{
+				Type: f.typeToAST(param.Type(), currentPkgPath, currentNames, pkgAliases, imports),
+			})
+		}
+	}
+
+	var results *ast.FieldList
+	if sig.Results() != nil && sig.Results().Len() > 0 {
+		results = &ast.FieldList{}
+		for i := 0; i < sig.Results().Len(); i++ {
+			result := sig.Results().At(i)
+			results.List = append(results.List, &ast.Field{
+				Type: f.typeToAST(result.Type(), currentPkgPath, currentNames, pkgAliases, imports),
+			})
+		}
+	}
+
+	return &ast.FuncType{
+		Params:  params,
+		Results: results,
+	}
+}
+
+// hasLocalConst checks if a list of statements contains any local const
+// declarations. Such functions cannot be flattened because const values
+// are only visible within the block they're declared in — splitting them
+// into separate switch cases makes them undefined in subsequent cases.
+func (f *CFF) hasLocalConst(stmts []ast.Stmt) bool {
+	for _, stmt := range stmts {
+		found := false
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			if found {
+				return false
+			}
+			if decl, ok := n.(*ast.GenDecl); ok && decl.Tok == token.CONST {
+				found = true
+				return false
+			}
+			return true
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// hasLocalTypeDecl checks if a list of statements contains any local type
+// declarations (e.g. "type Alias MyStruct"). Such types are only visible
+// within their declaring block and would become undefined after CFF splits
+// the function body into separate switch cases.
+func (f *CFF) hasLocalTypeDecl(stmts []ast.Stmt) bool {
+	for _, stmt := range stmts {
+		found := false
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			if found {
+				return false
+			}
+			if decl, ok := n.(*ast.GenDecl); ok && decl.Tok == token.TYPE {
+				found = true
+				return false
+			}
+			return true
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// hasGoto checks if a list of statements contains any goto statements or
+// labeled statements. After CFF splits the body into switch cases, goto
+// targets (labels) end up inside case blocks, and Go does not allow goto
+// to jump into a block — which causes a compile error.
+func (f *CFF) hasGoto(stmts []ast.Stmt) bool {
+	for _, stmt := range stmts {
+		found := false
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			if found {
+				return false
+			}
+			switch n.(type) {
+			case *ast.BranchStmt:
+				if b, ok := n.(*ast.BranchStmt); ok && b.Tok == token.GOTO {
+					found = true
+					return false
+				}
+			case *ast.LabeledStmt:
+				found = true
+				return false
+			}
+			return true
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *CFF) hasAnonymousStructTypeAssertion(stmts []ast.Stmt) bool {
+	for _, stmt := range stmts {
+		found := false
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			if found {
+				return false
+			}
+			if ta, ok := n.(*ast.TypeAssertExpr); ok && ta.Type != nil {
+				if _, isStruct := ta.Type.(*ast.StructType); isStruct {
+					found = true
+					return false
+				}
+			}
+			return true
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+func addImportsToFile(file *ast.File, imports map[string]string) {
+	if len(imports) == 0 {
+		return
+	}
+
+	// Собираем уже существующие импорты
+	existing := make(map[string]bool)
+	for _, imp := range file.Imports {
+		path := strings.Trim(imp.Path.Value, `"`)
+		existing[path] = true
+	}
+
+	// Находим или создаём import GenDecl
+	var importDecl *ast.GenDecl
+	for _, decl := range file.Decls {
+		if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.IMPORT {
+			importDecl = gen
+			break
+		}
+	}
+	if importDecl == nil {
+		importDecl = &ast.GenDecl{Tok: token.IMPORT, Lparen: 1}
+		file.Decls = append([]ast.Decl{importDecl}, file.Decls...)
+	}
+	if importDecl.Lparen == 0 {
+		importDecl.Lparen = 1 // включаем скобки чтобы можно было добавить импорты
+	}
+
+	for _, importPath := range imports {
+		if existing[importPath] {
+			continue
+		}
+		importDecl.Specs = append(importDecl.Specs, &ast.ImportSpec{
+			Path: &ast.BasicLit{Kind: token.STRING, Value: `"` + importPath + `"`},
+		})
+		file.Imports = append(file.Imports, &ast.ImportSpec{
+			Path: &ast.BasicLit{Kind: token.STRING, Value: `"` + importPath + `"`},
+		})
+		existing[importPath] = true
+	}
+}
+
+// isInterfaceAny reports whether expr represents the untyped interface{}
+// (the fallback type used when real type resolution fails).
+func isInterfaceAny(expr ast.Expr) bool {
+	if ident, ok := expr.(*ast.Ident); ok {
+		return ident.Name == "interface{}"
+	}
+	return false
+}
+
+// containsAnonymousStruct reports whether t is or contains an anonymous struct type.
+// For such types, typeToAST cannot reliably reconstruct renamed field names because
+// multiple anonymous structs with the same shape each get distinct renamed names.
+// The caller should use inferTypeFromExpr (AST-based) instead.
+func containsAnonymousStruct(t types.Type) bool {
+	switch typ := t.(type) {
+	case *types.Struct:
+		return true
+	case *types.Slice:
+		return containsAnonymousStruct(typ.Elem())
+	case *types.Array:
+		return containsAnonymousStruct(typ.Elem())
+	case *types.Pointer:
+		return containsAnonymousStruct(typ.Elem())
+	case *types.Named:
+		// Named types are fine — they have a stable declaration position.
+		return false
+	}
+	return false
 }

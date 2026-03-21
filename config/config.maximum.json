@@ -18,10 +18,10 @@
     "comments": {
       "enable": true
     },
-    "control_flow": {
-      "enable": false
-    },
     "identifiers": {
+      "enable": true
+    },
+    "control_flow": {
       "enable": true
     },
     "literals": {
@@ -33,6 +33,7 @@
     "flags": ["-ldflags", "-s -w", "-trimpath"],
     "goos": "windows",
     "goarch": "amd64",
-    "output_path": "."
+    "output_path": ".",
+    "binary_name": "output"
   }
 }

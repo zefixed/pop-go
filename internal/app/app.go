@@ -16,8 +16,6 @@ import (
 )
 
 func Run(cfg *models.Config) error {
-	fmt.Println(fmt.Sprintf("%+v", cfg))
-
 	// Global context
 	_, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
