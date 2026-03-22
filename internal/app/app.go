@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"fmt"
-	"gopkg.in/yaml.v3"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -13,6 +12,8 @@ import (
 	"pop-go/pkg/fs"
 	pkglog "pop-go/pkg/log"
 	"syscall"
+
+	"gopkg.in/yaml.v3"
 )
 
 func Run(cfg *models.Config) error {
@@ -108,7 +109,7 @@ func makeTempDir(cfg *models.Config) (string, error) {
 	var dir string
 	var err error
 	if cfg.App.TempDir == "" {
-		dir, err = os.MkdirTemp("/tmp", "")
+		dir, err = os.MkdirTemp(os.TempDir(), "")
 	} else {
 		dir = cfg.App.TempDir
 		err = os.MkdirAll("./"+cfg.App.TempDir, 0700)

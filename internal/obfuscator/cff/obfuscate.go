@@ -152,10 +152,21 @@ func (f *CFF) containsChannelOp(stmt ast.Stmt) bool {
 			found = true
 			return false
 		case *ast.CallExpr:
-			// Channel creation: make(chan T)
-			if ident, ok := n.(*ast.CallExpr).Fun.(*ast.Ident); ok && ident.Name == "make" {
-				found = true
-				return false
+			// Channel creation: make(chan T) — but NOT make([]T) or make(map[K]V).
+			// Check that the first argument is a chan type expression.
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				break
+			}
+			ident, ok := call.Fun.(*ast.Ident)
+			if !ok || ident.Name != "make" {
+				break
+			}
+			if len(call.Args) > 0 {
+				if _, isChan := call.Args[0].(*ast.ChanType); isChan {
+					found = true
+					return false
+				}
 			}
 		}
 		return true
@@ -282,7 +293,7 @@ func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliase
 	// For functions with return types we must return zero values to satisfy the compiler.
 	// (This return is always unreachable in practice — it only follows the last real
 	// statement which is itself a return — but the compiler still type-checks it.)
-	terminalReturn := f.buildZeroReturn(fn.Type.Results, currentPkgPath, currentNames, pkgAliases, imports)
+	terminalReturn := f.buildZeroReturn(fn.Type.Results)
 
 	for i, stmt := range originalStmts {
 		processed := f.convertDefineToAssign(stmt, hoistedVars)
@@ -668,7 +679,7 @@ func (f *CFF) inferTypeFromExpr(expr ast.Expr, varMap map[string]*VarInfo, types
 
 // inferTypeFromRangeKey infers the type of range loop's key variable.
 // For slices/arrays/maps, the key is typically int (index).
-func (f *CFF) inferTypeFromRangeKey(expr ast.Expr, varMap map[string]*VarInfo) ast.Expr {
+func (f *CFF) inferTypeFromRangeKey(expr ast.Expr) ast.Expr {
 	switch expr.(type) {
 	case *ast.Ident:
 		return &ast.Ident{Name: "int"}
@@ -809,7 +820,7 @@ func toExprs(idents []*ast.Ident) []ast.Expr {
 // result type in the function signature. For void functions returns `return`.
 // This is needed as the terminal transition in the CFF state machine because
 // a plain `return` without values is invalid in non-void functions.
-func (f *CFF) buildZeroReturn(results *ast.FieldList, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) *ast.ReturnStmt {
+func (f *CFF) buildZeroReturn(results *ast.FieldList) *ast.ReturnStmt {
 	if results == nil || len(results.List) == 0 {
 		return &ast.ReturnStmt{}
 	}
