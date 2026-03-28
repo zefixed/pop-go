@@ -9,6 +9,7 @@ import (
 	"pop-go/internal/obfuscator/cff"
 	"pop-go/internal/obfuscator/literals"
 	"pop-go/internal/obfuscator/renameIdentifiers"
+	"pop-go/pkg/util"
 )
 
 type Obfuscator struct {
@@ -42,12 +43,17 @@ func NewObfuscator(cfg *models.Config, log *slog.Logger) *Obfuscator {
 		}
 	}
 
+	// One rand for the entire obfuscation pass.
+	// All modules share it so every generated name advances the same PRNG —
+	// names are globally unique even when seed is fixed (e.g. --seed 1).
+	r := util.NewRand(cfg.Obfuscator.Seed)
+
 	return &Obfuscator{
 		cfg:               cfg,
 		log:               log,
 		pkgs:              pkgs,
-		literals:          literals.NewLiterals(cfg, log, pkgs),
-		renameIdentifiers: renameIdentifiers.NewRenameIdentifiers(cfg, log, pkgs),
-		controlFlow:       cff.NewCFF(cfg, log, pkgs),
+		literals:          literals.NewLiterals(cfg, log, pkgs, r),
+		renameIdentifiers: renameIdentifiers.NewRenameIdentifiers(cfg, log, pkgs, r),
+		controlFlow:       cff.NewCFF(cfg, log, pkgs, r),
 	}
 }

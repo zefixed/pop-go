@@ -1,6 +1,8 @@
 package literals
 
 import (
+	"math/rand"
+
 	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"pop-go/internal/models"
@@ -17,12 +19,14 @@ type Literals struct {
 	cfg  *models.Config
 	log  *slog.Logger
 	pkgs []*packages.Package
+	r    *rand.Rand
 }
 
-func NewLiterals(cfg *models.Config, log *slog.Logger, pkgs []*packages.Package) *Literals {
+func NewLiterals(cfg *models.Config, log *slog.Logger, pkgs []*packages.Package, r *rand.Rand) *Literals {
 	return &Literals{
 		cfg:  cfg,
 		log:  log,
 		pkgs: pkgs,
+		r:    r,
 	}
 }

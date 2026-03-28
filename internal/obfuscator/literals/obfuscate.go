@@ -56,7 +56,7 @@ func getObfuscationProfile(level string) ObfuscateLiteralsProfile {
 
 func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile ObfuscateLiteralsProfile, typesInfo *types.Info) error {
 	decryptKey := profile.GenerateKey(l.cfg.Obfuscator.Seed)
-	decryptFuncName := util.GenerateUniqueName(l.cfg.Obfuscator.Seed)
+	decryptFuncName := util.GenerateUniqueName(l.r)
 	decryptFunc := profile.DecryptFunction(decryptKey, decryptFuncName)
 
 	// Проверка на наличие функции дешифровки
