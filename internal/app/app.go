@@ -9,6 +9,7 @@ import (
 	"pop-go/internal/builder"
 	"pop-go/internal/models"
 	"pop-go/internal/obfuscator"
+	"pop-go/internal/tester"
 	"pop-go/pkg/fs"
 	pkglog "pop-go/pkg/log"
 	"syscall"
@@ -58,6 +59,15 @@ func Run(cfg *models.Config) error {
 		}(dir)
 	}
 
+	// Pre-obfuscation tests: run with default vet to catch issues early
+	if cfg.App.Test {
+		t := tester.NewTester(cfg, log)
+		if err = t.RunTests(cfg.Obfuscator.TargetPath, cfg.CurLocale["tst.stage.pre"]); err != nil {
+			stop()
+			return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
+		}
+	}
+
 	// Copying project to temp dir
 	err = fs.CopyDir(cfg.Obfuscator.TargetPath, dir)
 	if err != nil {
@@ -76,6 +86,16 @@ func Run(cfg *models.Config) error {
 	if err != nil {
 		log.Error(err.Error())
 		return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
+	}
+
+	// Post-obfuscation tests: -vet=off because obfuscation legitimately produces
+	// non-constant format strings and other patterns that vet rejects.
+	if cfg.App.Test {
+		t := tester.NewTester(cfg, log)
+		if err = t.RunTests(cfg.Obfuscator.TargetPath, cfg.CurLocale["tst.stage.post"], "-vet=off"); err != nil {
+			stop()
+			return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
+		}
 	}
 
 	// Start of building

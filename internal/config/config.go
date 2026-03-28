@@ -177,13 +177,15 @@ func initConfigPath() {
 
 func initApp() {
 	var lang, tempDir string
-	var removeTemp bool
+	var removeTemp, test bool
 	rootCmd.Flags().StringVarP(&lang, "lang", "l", "en", "Logging language.")
 	rootCmd.Flags().StringVar(&tempDir, "temp-dir", "", "Directory for storing temporary conversion files. By default, a unique directory will be generated in /tmp or C:\\Windows\\Temp and will be deleted if the --remove-temp=false flag is not set.")
 	rootCmd.Flags().BoolVar(&removeTemp, "remove-temp", true, "Allows to avoid deleting the temp-dir after processing by setting it false.")
+	rootCmd.Flags().BoolVar(&test, "test", true, "Runs the target project tests using go test.")
 	_ = viper.BindPFlag("app.lang", rootCmd.Flags().Lookup("lang"))
 	_ = viper.BindPFlag("app.temp_dir", rootCmd.Flags().Lookup("temp-dir"))
 	_ = viper.BindPFlag("app.remove_temp", rootCmd.Flags().Lookup("remove-temp"))
+	_ = viper.BindPFlag("app.test", rootCmd.Flags().Lookup("test"))
 }
 
 func initLog() {
