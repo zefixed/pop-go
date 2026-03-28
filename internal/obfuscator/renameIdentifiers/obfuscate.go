@@ -53,6 +53,10 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 	renameMap := make(map[types.Object]string)
 	importedNames := i.collectImportedNames(pkg.Syntax)
 
+	// Shared rand from the obfuscator — guarantees all modules in one pass
+	// advance the same PRNG, so names are unique even across modules.
+	r := i.r
+
 	// Secondary map for anonymous struct fields: (structTypeString + "." + fieldName) → newName.
 	anonFieldNames := make(map[string]string)
 
@@ -91,7 +95,7 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 							if existing, ok := anonFieldNames[canonicalKey]; ok {
 								renameMap[obj] = existing
 							} else {
-								newName := util.GenerateUniqueName(i.cfg.Obfuscator.Seed)
+								newName := util.GenerateUniqueName(r)
 								renameMap[obj] = newName
 								anonFieldNames[canonicalKey] = newName
 							}
@@ -108,14 +112,14 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 						if existing, ok := methodNames[origName]; ok {
 							renameMap[obj] = existing
 						} else {
-							newName := util.GenerateUniqueName(i.cfg.Obfuscator.Seed)
+							newName := util.GenerateUniqueName(r)
 							renameMap[obj] = newName
 							methodNames[origName] = newName
 						}
 						return true
 					}
 
-					renameMap[obj] = util.GenerateUniqueName(i.cfg.Obfuscator.Seed)
+					renameMap[obj] = util.GenerateUniqueName(r)
 				}
 			}
 

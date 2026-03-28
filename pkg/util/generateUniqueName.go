@@ -5,17 +5,28 @@ import (
 	"time"
 )
 
-func GenerateUniqueName(seed int64) string {
-	alphabet := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+// NewRand creates a *rand.Rand seeded with seed.
+// If seed is 0 a unique seed derived from the current time is used.
+// The returned instance must be reused across all GenerateUniqueName calls
+// within the same obfuscation pass — never create a new one per call,
+// because on Windows the system timer resolution can be ~15 ms, causing
+// multiple rapid time.Now().UnixNano() calls to return the same value and
+// therefore produce identical names.
+func NewRand(seed int64) *rand.Rand {
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
-	localRand := rand.New(rand.NewSource(seed))
+	return rand.New(rand.NewSource(seed))
+}
 
-	// Generate random func name of length [16, 32)
-	b := make([]byte, localRand.Intn(16)+16)
+// GenerateUniqueName returns a random identifier of length [16, 32) using r.
+// r must be initialised once (via NewRand) and reused for every call in the
+// same pass to guarantee distinct names.
+func GenerateUniqueName(r *rand.Rand) string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	b := make([]byte, r.Intn(16)+16)
 	for i := range b {
-		b[i] = alphabet[localRand.Intn(len(alphabet))]
+		b[i] = alphabet[r.Intn(len(alphabet))]
 	}
 	return string(b)
 }

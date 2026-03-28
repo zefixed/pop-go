@@ -190,7 +190,7 @@ type VarInfo struct {
 // to maintain visibility across case boundaries.
 func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliases map[string]string, imports map[string]string) error {
 	hoistedVars := make(map[string]bool)
-	stateVarName := util.GenerateUniqueName(f.cfg.Obfuscator.Seed)
+	stateVarName := util.GenerateUniqueName(f.r)
 	originalStmts := fn.Body.List
 	typesInfo := pkg.TypesInfo
 	currentPkgPath := pkg.Types.Path() // Use full import path for accurate type comparison
