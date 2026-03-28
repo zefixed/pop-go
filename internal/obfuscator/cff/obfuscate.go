@@ -7,6 +7,7 @@ import (
 	"go/types"
 	"log/slog"
 	"pop-go/pkg/util"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,8 +20,22 @@ import (
 func (f *CFF) Obfuscate() {
 	f.log.Info(f.cfg.CurLocale["obf.info.start.cff"])
 	t := time.Now()
-	for _, pkg := range f.pkgs {
-		for _, file := range pkg.Syntax {
+
+	// Sort packages by path for deterministic PRNG consumption order.
+	sortedPkgs := make([]*packages.Package, len(f.pkgs))
+	copy(sortedPkgs, f.pkgs)
+	sort.Slice(sortedPkgs, func(a, b int) bool {
+		return sortedPkgs[a].PkgPath < sortedPkgs[b].PkgPath
+	})
+
+	for _, pkg := range sortedPkgs {
+		// Sort files by name for deterministic output.
+		sortedFiles := make([]*ast.File, len(pkg.Syntax))
+		copy(sortedFiles, pkg.Syntax)
+		sort.Slice(sortedFiles, func(a, b int) bool {
+			return pkg.Fset.File(sortedFiles[a].Pos()).Name() < pkg.Fset.File(sortedFiles[b].Pos()).Name()
+		})
+		for _, file := range sortedFiles {
 			absPath := pkg.Fset.File(file.Pos()).Name()
 			f.log.Debug(f.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", absPath))
 			if err := f.flattenFile(file, pkg); err != nil {
@@ -266,7 +281,16 @@ func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliase
 	}
 
 	var hoistedDecls []ast.Stmt
-	for _, v := range varInfoMap {
+	// Sort variable names so hoisted declarations are always in the same order.
+	// map iteration order in Go is randomised; without sorting the output AST
+	// differs between runs even with a fixed seed.
+	varNames := make([]string, 0, len(varInfoMap))
+	for name := range varInfoMap {
+		varNames = append(varNames, name)
+	}
+	sort.Strings(varNames)
+	for _, name := range varNames {
+		v := varInfoMap[name]
 		if v.IsParam {
 			continue
 		}
@@ -1151,7 +1175,14 @@ func addImportsToFile(file *ast.File, imports map[string]string) {
 		importDecl.Lparen = 1 // включаем скобки чтобы можно было добавить импорты
 	}
 
-	for _, importPath := range imports {
+	// Sort import paths for deterministic spec order in the output file.
+	importPaths := make([]string, 0, len(imports))
+	for _, path := range imports {
+		importPaths = append(importPaths, path)
+	}
+	sort.Strings(importPaths)
+
+	for _, importPath := range importPaths {
 		if existing[importPath] {
 			continue
 		}

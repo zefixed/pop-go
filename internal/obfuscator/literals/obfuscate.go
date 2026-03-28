@@ -7,8 +7,10 @@ import (
 	"go/token"
 	"go/types"
 	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"pop-go/pkg/util"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,8 +26,21 @@ func (l *Literals) Obfuscate(level string) error {
 		return fmt.Errorf(l.cfg.CurLocale["obf.err.lit.profile"], level)
 	}
 
-	for _, pkg := range l.pkgs {
-		for _, file := range pkg.Syntax {
+	// Sort packages by path for deterministic output.
+	sortedPkgs := make([]*packages.Package, len(l.pkgs))
+	copy(sortedPkgs, l.pkgs)
+	sort.Slice(sortedPkgs, func(a, b int) bool {
+		return sortedPkgs[a].PkgPath < sortedPkgs[b].PkgPath
+	})
+
+	for _, pkg := range sortedPkgs {
+		// Sort files by name for deterministic output.
+		sortedFiles := make([]*ast.File, len(pkg.Syntax))
+		copy(sortedFiles, pkg.Syntax)
+		sort.Slice(sortedFiles, func(a, b int) bool {
+			return pkg.Fset.File(sortedFiles[a].Pos()).Name() < pkg.Fset.File(sortedFiles[b].Pos()).Name()
+		})
+		for _, file := range sortedFiles {
 			// Getting absolute path of file
 			absPath := pkg.Fset.File(file.Pos()).Name()
 

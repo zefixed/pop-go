@@ -9,6 +9,7 @@ import (
 	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"pop-go/pkg/util"
+	"sort"
 	"strings"
 	"time"
 )
@@ -24,7 +25,14 @@ func (i *RenameIdentifiers) Obfuscate() error {
 	i.log.Info(i.cfg.CurLocale["obf.info.start.ren.ids"])
 	t := time.Now()
 
-	for _, pkg := range i.pkgs {
+	// Sort packages by path so PRNG is consumed in the same order every run.
+	sortedPkgs := make([]*packages.Package, len(i.pkgs))
+	copy(sortedPkgs, i.pkgs)
+	sort.Slice(sortedPkgs, func(a, b int) bool {
+		return sortedPkgs[a].PkgPath < sortedPkgs[b].PkgPath
+	})
+
+	for _, pkg := range sortedPkgs {
 		if pkg.TypesInfo == nil {
 			i.log.Warn(i.cfg.CurLocale["obf.warn.pkg.types"],
 				slog.String("pkg", pkg.PkgPath),
@@ -35,7 +43,14 @@ func (i *RenameIdentifiers) Obfuscate() error {
 		// Build package-level rename map for consistent renaming across all files
 		renameMap := i.buildRenameMap(pkg, pkg.PkgPath)
 
-		for _, file := range pkg.Syntax {
+		// Sort files by name for deterministic output.
+		sortedFiles := make([]*ast.File, len(pkg.Syntax))
+		copy(sortedFiles, pkg.Syntax)
+		sort.Slice(sortedFiles, func(a, b int) bool {
+			return pkg.Fset.File(sortedFiles[a].Pos()).Name() < pkg.Fset.File(sortedFiles[b].Pos()).Name()
+		})
+
+		for _, file := range sortedFiles {
 			absPath := pkg.Fset.File(file.Pos()).Name()
 			i.log.Debug(i.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", absPath))
 
@@ -67,7 +82,14 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 	// would produce different names, breaking the interface satisfaction check.
 	methodNames := make(map[string]string)
 
-	for _, file := range pkg.Syntax {
+	// Sort files for deterministic PRNG consumption order.
+	sortedFiles := make([]*ast.File, len(pkg.Syntax))
+	copy(sortedFiles, pkg.Syntax)
+	sort.Slice(sortedFiles, func(a, b int) bool {
+		return pkg.Fset.File(sortedFiles[a].Pos()).Name() < pkg.Fset.File(sortedFiles[b].Pos()).Name()
+	})
+
+	for _, file := range sortedFiles {
 		typeSwitchVars := collectTypeSwitchVars(file)
 
 		processed := make(map[token.Pos]bool)
