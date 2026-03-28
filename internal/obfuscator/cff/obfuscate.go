@@ -7,7 +7,6 @@ import (
 	"go/types"
 	"log/slog"
 	"pop-go/pkg/util"
-	"sort"
 	"strings"
 	"time"
 
@@ -20,23 +19,12 @@ import (
 func (f *CFF) Obfuscate() {
 	f.log.Info(f.cfg.CurLocale["obf.info.start.cff"])
 	t := time.Now()
-
-	// Sort packages by path for deterministic PRNG consumption order.
-	sortedPkgs := make([]*packages.Package, len(f.pkgs))
-	copy(sortedPkgs, f.pkgs)
-	sort.Slice(sortedPkgs, func(a, b int) bool {
-		return sortedPkgs[a].PkgPath < sortedPkgs[b].PkgPath
-	})
-
-	for _, pkg := range sortedPkgs {
-		// Sort files by name for deterministic output.
-		sortedFiles := make([]*ast.File, len(pkg.Syntax))
-		copy(sortedFiles, pkg.Syntax)
-		sort.Slice(sortedFiles, func(a, b int) bool {
-			return pkg.Fset.File(sortedFiles[a].Pos()).Name() < pkg.Fset.File(sortedFiles[b].Pos()).Name()
-		})
-		for _, file := range sortedFiles {
+	for _, pkg := range f.pkgs {
+		for _, file := range util.SortedSyntax(pkg) {
 			absPath := pkg.Fset.File(file.Pos()).Name()
+			if strings.HasSuffix(absPath, "_test.go") {
+				continue
+			}
 			f.log.Debug(f.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", absPath))
 			if err := f.flattenFile(file, pkg); err != nil {
 				f.log.Error(f.cfg.CurLocale["obf.err.cff"], slog.String("file", absPath), slog.Any("error", err))
@@ -205,7 +193,7 @@ type VarInfo struct {
 // to maintain visibility across case boundaries.
 func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliases map[string]string, imports map[string]string) error {
 	hoistedVars := make(map[string]bool)
-	stateVarName := util.GenerateUniqueName(f.r)
+	stateVarName := util.GenerateUniqueName(f.r, f.used)
 	originalStmts := fn.Body.List
 	typesInfo := pkg.TypesInfo
 	currentPkgPath := pkg.Types.Path() // Use full import path for accurate type comparison
@@ -234,7 +222,7 @@ func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliase
 	// `error` also have obj.Pos() == 0, so if we stored a synthetic name at key 0,
 	// typeToAST would rename `error` to the state variable name.
 	currentNames := make(map[token.Pos]string)
-	for _, file := range pkg.Syntax {
+	for _, file := range util.SortedSyntax(pkg) {
 		ast.Inspect(file, func(n ast.Node) bool {
 			switch node := n.(type) {
 			case *ast.TypeSpec:
@@ -273,6 +261,19 @@ func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliase
 		}
 	}
 
+	// Named return values are implicitly declared at function scope — exactly
+	// like parameters. If CFF hoists them again as "var x T" a redeclaration
+	// compile error occurs. Mark them IsParam=true so the hoisting loop skips them.
+	if fn.Type.Results != nil {
+		for _, result := range fn.Type.Results.List {
+			for _, name := range result.Names {
+				if name.Name != "_" {
+					varInfoMap[name.Name] = &VarInfo{Name: name.Name, Type: result.Type, IsParam: true}
+				}
+			}
+		}
+	}
+
 	for _, stmt := range originalStmts {
 		f.collectVarsWithTypes(stmt, varInfoMap, typesInfo, posToType, currentPkgPath, currentNames, pkgAliases, imports)
 	}
@@ -281,16 +282,7 @@ func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliase
 	}
 
 	var hoistedDecls []ast.Stmt
-	// Sort variable names so hoisted declarations are always in the same order.
-	// map iteration order in Go is randomised; without sorting the output AST
-	// differs between runs even with a fixed seed.
-	varNames := make([]string, 0, len(varInfoMap))
-	for name := range varInfoMap {
-		varNames = append(varNames, name)
-	}
-	sort.Strings(varNames)
-	for _, name := range varNames {
-		v := varInfoMap[name]
+	for _, v := range varInfoMap {
 		if v.IsParam {
 			continue
 		}
@@ -317,7 +309,19 @@ func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliase
 	// For functions with return types we must return zero values to satisfy the compiler.
 	// (This return is always unreachable in practice — it only follows the last real
 	// statement which is itself a return — but the compiler still type-checks it.)
-	terminalReturn := f.buildZeroReturn(fn.Type.Results)
+	// Use types.Type-aware builder so interface return types (error, cipher.AEAD, etc.)
+	// produce nil instead of the invalid composite literal T{}.
+	var terminalReturn *ast.ReturnStmt
+	if typesInfo != nil {
+		if obj := typesInfo.Defs[fn.Name]; obj != nil {
+			if sig, ok := obj.Type().(*types.Signature); ok {
+				terminalReturn = f.buildZeroReturnFromSig(sig, currentPkgPath, currentNames, pkgAliases, imports)
+			}
+		}
+	}
+	if terminalReturn == nil {
+		terminalReturn = f.buildZeroReturn(fn.Type.Results)
+	}
 
 	for i, stmt := range originalStmts {
 		processed := f.convertDefineToAssign(stmt, hoistedVars)
@@ -840,6 +844,61 @@ func toExprs(idents []*ast.Ident) []ast.Expr {
 	return exprs
 }
 
+// buildZeroReturnFromSig builds a zero-value return using the type checker's
+// types.Signature. Unlike buildZeroReturn (AST-only), this correctly handles
+// interface types (error, cipher.AEAD, io.Reader, …) by returning nil instead
+// of the invalid composite literal T{}.
+func (f *CFF) buildZeroReturnFromSig(sig *types.Signature, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) *ast.ReturnStmt {
+	results := sig.Results()
+	if results == nil || results.Len() == 0 {
+		return &ast.ReturnStmt{}
+	}
+	var retVals []ast.Expr
+	for i := 0; i < results.Len(); i++ {
+		retVals = append(retVals, f.zeroValueForTypesType(results.At(i).Type(), currentPkgPath, currentNames, pkgAliases, imports))
+	}
+	return &ast.ReturnStmt{Results: retVals}
+}
+
+// zeroValueForTypesType returns the zero-value AST expression for a types.Type.
+// It correctly returns nil for any interface type (including named interfaces
+// such as error or cipher.AEAD), and delegates to typeToAST for struct/named types.
+func (f *CFF) zeroValueForTypesType(t types.Type, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) ast.Expr {
+	switch typ := t.(type) {
+	case *types.Basic:
+		switch typ.Kind() {
+		case types.Bool:
+			return &ast.Ident{Name: "false"}
+		case types.String:
+			return &ast.BasicLit{Kind: token.STRING, Value: `""`}
+		case types.Int, types.Int8, types.Int16, types.Int32, types.Int64,
+			types.Uint, types.Uint8, types.Uint16, types.Uint32, types.Uint64,
+			types.Uintptr, types.Float32, types.Float64,
+			types.Complex64, types.Complex128:
+			return &ast.BasicLit{Kind: token.INT, Value: "0"}
+		}
+		return &ast.BasicLit{Kind: token.INT, Value: "0"}
+	case *types.Pointer, *types.Slice, *types.Map, *types.Chan, *types.Signature:
+		return &ast.Ident{Name: "nil"}
+	case *types.Interface:
+		// All interfaces (error, io.Reader, cipher.AEAD, …) → nil.
+		return &ast.Ident{Name: "nil"}
+	case *types.Named:
+		// Check underlying first — a named interface (e.g. type MyErr interface{…})
+		// must also return nil.
+		if _, isIface := typ.Underlying().(*types.Interface); isIface {
+			return &ast.Ident{Name: "nil"}
+		}
+		// Named struct or alias → zero composite literal using the AST type expression.
+		return &ast.CompositeLit{Type: f.typeToAST(t, currentPkgPath, currentNames, pkgAliases, imports)}
+	case *types.Struct:
+		return &ast.CompositeLit{Type: f.typeToAST(t, currentPkgPath, currentNames, pkgAliases, imports)}
+	case *types.Alias:
+		return f.zeroValueForTypesType(types.Unalias(typ), currentPkgPath, currentNames, pkgAliases, imports)
+	}
+	return &ast.Ident{Name: "nil"}
+}
+
 // buildZeroReturn constructs a return statement with zero values for each
 // result type in the function signature. For void functions returns `return`.
 // This is needed as the terminal transition in the CFF state machine because
@@ -1175,14 +1234,7 @@ func addImportsToFile(file *ast.File, imports map[string]string) {
 		importDecl.Lparen = 1 // включаем скобки чтобы можно было добавить импорты
 	}
 
-	// Sort import paths for deterministic spec order in the output file.
-	importPaths := make([]string, 0, len(imports))
-	for _, path := range imports {
-		importPaths = append(importPaths, path)
-	}
-	sort.Strings(importPaths)
-
-	for _, importPath := range importPaths {
+	for _, importPath := range imports {
 		if existing[importPath] {
 			continue
 		}

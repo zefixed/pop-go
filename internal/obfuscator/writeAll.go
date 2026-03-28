@@ -3,35 +3,19 @@ package obfuscator
 import (
 	"bytes"
 	"fmt"
-	"go/ast"
 	"go/format"
-	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"os"
-	"sort"
 )
 
 func (o *Obfuscator) WriteAll() error {
 	o.log.Info(o.cfg.CurLocale["obf.info.writing.files"])
-
-	sortedPkgs := make([]*packages.Package, len(o.pkgs))
-	copy(sortedPkgs, o.pkgs)
-	sort.Slice(sortedPkgs, func(a, b int) bool {
-		return sortedPkgs[a].PkgPath < sortedPkgs[b].PkgPath
-	})
-
-	for _, pkg := range sortedPkgs {
+	for _, pkg := range o.pkgs {
 		if pkg.TypesInfo == nil {
 			continue
 		}
 
-		sortedFiles := make([]*ast.File, len(pkg.Syntax))
-		copy(sortedFiles, pkg.Syntax)
-		sort.Slice(sortedFiles, func(a, b int) bool {
-			return pkg.Fset.File(sortedFiles[a].Pos()).Name() < pkg.Fset.File(sortedFiles[b].Pos()).Name()
-		})
-
-		for _, file := range sortedFiles {
+		for _, file := range pkg.Syntax {
 			filePath := pkg.Fset.File(file.Pos()).Name()
 			o.log.Debug(o.cfg.CurLocale["obf.debug.writing.file"], slog.String("filename", filePath))
 

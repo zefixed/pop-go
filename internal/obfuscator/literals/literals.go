@@ -20,13 +20,15 @@ type Literals struct {
 	log  *slog.Logger
 	pkgs []*packages.Package
 	r    *rand.Rand
+	used map[string]struct{}
 }
 
-func NewLiterals(cfg *models.Config, log *slog.Logger, pkgs []*packages.Package, r *rand.Rand) *Literals {
+func NewLiterals(cfg *models.Config, log *slog.Logger, pkgs []*packages.Package, r *rand.Rand, used map[string]struct{}) *Literals {
 	return &Literals{
 		cfg:  cfg,
 		log:  log,
 		pkgs: pkgs,
 		r:    r,
+		used: used,
 	}
 }
