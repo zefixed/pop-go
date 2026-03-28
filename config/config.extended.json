@@ -4,7 +4,8 @@
     "version": "0.0.1",
     "lang": "en",
     "temp_dir": "",
-    "remove_temp": true
+    "remove_temp": true,
+    "test": true
   },
   "log": {
     "level": "info",

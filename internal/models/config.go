@@ -14,6 +14,7 @@ type App struct {
 	Lang       string `json:"lang" mapstructure:"lang"`
 	TempDir    string `json:"temp_dir" mapstructure:"temp_dir"`
 	RemoveTemp bool   `json:"remove_temp" mapstructure:"remove_temp"`
+	Test       bool   `json:"test" mapstructure:"test"`
 }
 
 type Log struct {
