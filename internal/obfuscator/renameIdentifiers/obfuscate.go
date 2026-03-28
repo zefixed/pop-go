@@ -9,7 +9,6 @@ import (
 	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"pop-go/pkg/util"
-	"sort"
 	"strings"
 	"time"
 )
@@ -25,14 +24,7 @@ func (i *RenameIdentifiers) Obfuscate() error {
 	i.log.Info(i.cfg.CurLocale["obf.info.start.ren.ids"])
 	t := time.Now()
 
-	// Sort packages by path so PRNG is consumed in the same order every run.
-	sortedPkgs := make([]*packages.Package, len(i.pkgs))
-	copy(sortedPkgs, i.pkgs)
-	sort.Slice(sortedPkgs, func(a, b int) bool {
-		return sortedPkgs[a].PkgPath < sortedPkgs[b].PkgPath
-	})
-
-	for _, pkg := range sortedPkgs {
+	for _, pkg := range i.pkgs {
 		if pkg.TypesInfo == nil {
 			i.log.Warn(i.cfg.CurLocale["obf.warn.pkg.types"],
 				slog.String("pkg", pkg.PkgPath),
@@ -43,14 +35,7 @@ func (i *RenameIdentifiers) Obfuscate() error {
 		// Build package-level rename map for consistent renaming across all files
 		renameMap := i.buildRenameMap(pkg, pkg.PkgPath)
 
-		// Sort files by name for deterministic output.
-		sortedFiles := make([]*ast.File, len(pkg.Syntax))
-		copy(sortedFiles, pkg.Syntax)
-		sort.Slice(sortedFiles, func(a, b int) bool {
-			return pkg.Fset.File(sortedFiles[a].Pos()).Name() < pkg.Fset.File(sortedFiles[b].Pos()).Name()
-		})
-
-		for _, file := range sortedFiles {
+		for _, file := range util.SortedSyntax(pkg) {
 			absPath := pkg.Fset.File(file.Pos()).Name()
 			i.log.Debug(i.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", absPath))
 
@@ -82,14 +67,10 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 	// would produce different names, breaking the interface satisfaction check.
 	methodNames := make(map[string]string)
 
-	// Sort files for deterministic PRNG consumption order.
-	sortedFiles := make([]*ast.File, len(pkg.Syntax))
-	copy(sortedFiles, pkg.Syntax)
-	sort.Slice(sortedFiles, func(a, b int) bool {
-		return pkg.Fset.File(sortedFiles[a].Pos()).Name() < pkg.Fset.File(sortedFiles[b].Pos()).Name()
-	})
-
-	for _, file := range sortedFiles {
+	for _, file := range util.SortedSyntax(pkg) {
+		if strings.HasSuffix(pkg.Fset.File(file.Pos()).Name(), "_test.go") {
+			continue
+		}
 		typeSwitchVars := collectTypeSwitchVars(file)
 
 		processed := make(map[token.Pos]bool)
@@ -110,6 +91,42 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 
 			obj := pkg.TypesInfo.ObjectOf(ident)
 			if obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == currentPkgPath {
+
+				// ── Embedded (anonymous) field synchronisation ───────────────────
+				// For `*runner` or `runner` anonymous fields the single AST ident is
+				// in TypesInfo TWICE:
+				//   Defs[ident] → *types.Var  (the promoted struct field)
+				//   Uses[ident] → *types.TypeName  (the referenced type)
+				// ObjectOf prefers Defs → obj = Var. Without special-casing, the
+				// TypeName (a different types.Object) would get a DIFFERENT random
+				// name. tcp.go would embed `*X` while runner.go defines `type Y` →
+				// "undefined: X".
+				// Fix: when we see an anonymous-field Var, retrieve the TypeName from
+				// Uses and ensure both always share one name.
+				if varObj, isVar := obj.(*types.Var); isVar && varObj.Anonymous() {
+					typeNameObj := pkg.TypesInfo.Uses[ident]
+					if typeNameObj != nil &&
+						typeNameObj.Pkg() != nil &&
+						typeNameObj.Pkg().Path() == currentPkgPath {
+						existingVar, varHasName := renameMap[obj]
+						existingType, typeHasName := renameMap[typeNameObj]
+						switch {
+						case varHasName && typeHasName:
+							// Both already assigned — nothing to do.
+						case varHasName:
+							renameMap[typeNameObj] = existingVar
+						case typeHasName:
+							renameMap[obj] = existingType
+						default:
+							newName := util.GenerateUniqueName(r, i.used)
+							renameMap[obj] = newName
+							renameMap[typeNameObj] = newName
+						}
+						return true
+					}
+				}
+				// ─────────────────────────────────────────────────────────────────
+
 				if _, exists := renameMap[obj]; !exists {
 					// For fields of anonymous structs, use canonical key for consistency.
 					if field, ok := obj.(*types.Var); ok && field.IsField() {
@@ -117,7 +134,7 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 							if existing, ok := anonFieldNames[canonicalKey]; ok {
 								renameMap[obj] = existing
 							} else {
-								newName := util.GenerateUniqueName(r)
+								newName := util.GenerateUniqueName(r, i.used)
 								renameMap[obj] = newName
 								anonFieldNames[canonicalKey] = newName
 							}
@@ -134,19 +151,58 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 						if existing, ok := methodNames[origName]; ok {
 							renameMap[obj] = existing
 						} else {
-							newName := util.GenerateUniqueName(r)
+							newName := util.GenerateUniqueName(r, i.used)
 							renameMap[obj] = newName
 							methodNames[origName] = newName
 						}
 						return true
 					}
 
-					renameMap[obj] = util.GenerateUniqueName(r)
+					renameMap[obj] = util.GenerateUniqueName(r, i.used)
 				}
 			}
 
 			return true
 		})
+	}
+
+	// ── Embedded-type post-pass ─────────────────────────────────────────────
+	// An embedded field like *stop has TWO distinct types.Object:
+	//   Var   (the promoted field, keyed by Defs[ident] of the embed line)
+	//   TypeName (the type, keyed by Defs[ident] of the type declaration)
+	//
+	// The Uses-based sync in the main loop can miss some cases, e.g. when the
+	// identifier is in a selector expression (s.stop) where Uses returns the
+	// Var itself, not the TypeName. This post-pass ensures both always share
+	// one name by resolving Var.Type() → Named.Obj() → TypeName directly.
+	for varObj, varName := range renameMap {
+		v, ok := varObj.(*types.Var)
+		if !ok || !v.Anonymous() {
+			continue
+		}
+		typ := v.Type()
+		if ptr, isPtr := typ.(*types.Pointer); isPtr {
+			typ = ptr.Elem()
+		}
+		named, ok := typ.(*types.Named)
+		if !ok {
+			continue
+		}
+		tnObj := named.Obj()
+		if tnObj == nil || tnObj.Pkg() == nil || tnObj.Pkg().Path() != currentPkgPath {
+			continue
+		}
+		existing, exists := renameMap[tnObj]
+		switch {
+		case !exists:
+			// TypeName not yet renamed — give it the same name as the Var.
+			renameMap[tnObj] = varName
+		case existing == varName:
+			// Already in sync.
+		default:
+			// Names diverged — the type DECLARATION is authoritative.
+			renameMap[varObj] = existing
+		}
 	}
 
 	return renameMap

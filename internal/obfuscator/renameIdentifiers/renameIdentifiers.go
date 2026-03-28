@@ -13,13 +13,15 @@ type RenameIdentifiers struct {
 	log  *slog.Logger
 	pkgs []*packages.Package
 	r    *rand.Rand
+	used map[string]struct{}
 }
 
-func NewRenameIdentifiers(cfg *models.Config, log *slog.Logger, pkgs []*packages.Package, r *rand.Rand) *RenameIdentifiers {
+func NewRenameIdentifiers(cfg *models.Config, log *slog.Logger, pkgs []*packages.Package, r *rand.Rand, used map[string]struct{}) *RenameIdentifiers {
 	return &RenameIdentifiers{
 		cfg:  cfg,
 		log:  log,
 		pkgs: pkgs,
 		r:    r,
+		used: used,
 	}
 }

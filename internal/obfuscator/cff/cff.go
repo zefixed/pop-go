@@ -13,13 +13,15 @@ type CFF struct {
 	log  *slog.Logger
 	pkgs []*packages.Package
 	r    *rand.Rand
+	used map[string]struct{}
 }
 
-func NewCFF(cfg *models.Config, log *slog.Logger, pkgs []*packages.Package, r *rand.Rand) *CFF {
+func NewCFF(cfg *models.Config, log *slog.Logger, pkgs []*packages.Package, r *rand.Rand, used map[string]struct{}) *CFF {
 	return &CFF{
 		cfg:  cfg,
 		log:  log,
 		pkgs: pkgs,
 		r:    r,
+		used: used,
 	}
 }

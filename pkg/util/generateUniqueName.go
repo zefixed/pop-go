@@ -22,11 +22,21 @@ func NewRand(seed int64) *rand.Rand {
 // GenerateUniqueName returns a random identifier of length [16, 32) using r.
 // r must be initialised once (via NewRand) and reused for every call in the
 // same pass to guarantee distinct names.
-func GenerateUniqueName(r *rand.Rand) string {
+// used is a set of already-allocated names; the function retries until it
+// produces a name not present in the set, then records it. This prevents
+// collisions between variables that end up in the same scope after CFF hoisting
+// or between modules that share the same PRNG with a fixed seed.
+func GenerateUniqueName(r *rand.Rand, used map[string]struct{}) string {
 	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	b := make([]byte, r.Intn(16)+16)
-	for i := range b {
-		b[i] = alphabet[r.Intn(len(alphabet))]
+	for {
+		b := make([]byte, r.Intn(16)+16)
+		for i := range b {
+			b[i] = alphabet[r.Intn(len(alphabet))]
+		}
+		name := string(b)
+		if _, exists := used[name]; !exists {
+			used[name] = struct{}{}
+			return name
+		}
 	}
-	return string(b)
 }

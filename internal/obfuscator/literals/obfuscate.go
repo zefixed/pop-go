@@ -7,10 +7,8 @@ import (
 	"go/token"
 	"go/types"
 	"golang.org/x/tools/go/ast/astutil"
-	"golang.org/x/tools/go/packages"
 	"log/slog"
 	"pop-go/pkg/util"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,23 +24,13 @@ func (l *Literals) Obfuscate(level string) error {
 		return fmt.Errorf(l.cfg.CurLocale["obf.err.lit.profile"], level)
 	}
 
-	// Sort packages by path for deterministic output.
-	sortedPkgs := make([]*packages.Package, len(l.pkgs))
-	copy(sortedPkgs, l.pkgs)
-	sort.Slice(sortedPkgs, func(a, b int) bool {
-		return sortedPkgs[a].PkgPath < sortedPkgs[b].PkgPath
-	})
-
-	for _, pkg := range sortedPkgs {
-		// Sort files by name for deterministic output.
-		sortedFiles := make([]*ast.File, len(pkg.Syntax))
-		copy(sortedFiles, pkg.Syntax)
-		sort.Slice(sortedFiles, func(a, b int) bool {
-			return pkg.Fset.File(sortedFiles[a].Pos()).Name() < pkg.Fset.File(sortedFiles[b].Pos()).Name()
-		})
-		for _, file := range sortedFiles {
+	for _, pkg := range l.pkgs {
+		for _, file := range util.SortedSyntax(pkg) {
 			// Getting absolute path of file
 			absPath := pkg.Fset.File(file.Pos()).Name()
+			if strings.HasSuffix(absPath, "_test.go") {
+				continue
+			}
 
 			l.log.Debug(l.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", absPath))
 
@@ -71,7 +59,7 @@ func getObfuscationProfile(level string) ObfuscateLiteralsProfile {
 
 func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile ObfuscateLiteralsProfile, typesInfo *types.Info) error {
 	decryptKey := profile.GenerateKey(l.cfg.Obfuscator.Seed)
-	decryptFuncName := util.GenerateUniqueName(l.r)
+	decryptFuncName := util.GenerateUniqueName(l.r, l.used)
 	decryptFunc := profile.DecryptFunction(decryptKey, decryptFuncName)
 
 	// Проверка на наличие функции дешифровки
