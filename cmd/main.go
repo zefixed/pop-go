@@ -1,3 +1,4 @@
+// Package main is the entry point for the pop-go obfuscator CLI.
 package main
 
 import (
@@ -6,10 +7,8 @@ import (
 	"pop-go/internal/config"
 )
 
-// TODO:
-//   - Строковые литералы: сделать hard обфускацию
-//   - Control Flow Flattening
-//   - Вставка мертвого кода (сначала проверить не будет ли он удаляться компилятором)
+// main initialises the CLI via [config.Execute] and exits with a non-zero
+// status code if an error is returned.
 func main() {
 	if err := config.Execute(); err != nil {
 		fmt.Println(err)

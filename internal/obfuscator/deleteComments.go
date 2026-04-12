@@ -10,6 +10,9 @@ import (
 	"time"
 )
 
+// DeleteComments removes all doc-comments and inline comments from every
+// source file in the loaded packages. Each file is re-formatted with
+// go/format after stripping and written back to its path in the temp directory.
 func (o *Obfuscator) DeleteComments() {
 	o.log.Info(o.cfg.CurLocale["obf.info.start.del.comm"])
 	t := time.Now()

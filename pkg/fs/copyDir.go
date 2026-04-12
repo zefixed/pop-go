@@ -1,3 +1,4 @@
+// Package fs provides filesystem utility functions used throughout pop-go.
 package fs
 
 import (
@@ -7,13 +8,15 @@ import (
 	"path/filepath"
 )
 
+// CopyDir recursively copies the directory tree rooted at src into dst,
+// preserving the relative path structure. Destination directories are created
+// with permission 0755. Existing files in dst are overwritten.
 func CopyDir(src, dst string) error {
 	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 
-		// Строим путь назначения
 		rel, err := filepath.Rel(src, path)
 		if err != nil {
 			return err
@@ -24,7 +27,6 @@ func CopyDir(src, dst string) error {
 			return os.MkdirAll(dstPath, 0755)
 		}
 
-		// Копируем файл
 		srcFile, err := os.Open(path)
 		if err != nil {
 			return err

@@ -6,6 +6,10 @@ import (
 	"path/filepath"
 )
 
+// PathExists reports whether the file or directory at path exists.
+// The path is resolved to an absolute path before the check.
+// Returns (false, nil) when the path is simply absent; returns (false, err)
+// only for unexpected stat errors.
 func PathExists(path string) (bool, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {

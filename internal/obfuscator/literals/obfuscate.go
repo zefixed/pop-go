@@ -14,11 +14,14 @@ import (
 	"time"
 )
 
+// Obfuscate encrypts all string literals in every non-test source file using
+// the encryption profile selected by level. For each file a unique decrypt
+// function is injected and every plain string literal is replaced with a call
+// to it. Test files are skipped to avoid breaking test assertions.
 func (l *Literals) Obfuscate(level string) error {
 	l.log.Info(l.cfg.CurLocale["obf.info.start.obf.lit"])
 	t := time.Now()
 
-	// Getting obfuscation profile
 	profile := getObfuscationProfile(level)
 	if profile == nil {
 		return fmt.Errorf(l.cfg.CurLocale["obf.err.lit.profile"], level)
@@ -26,7 +29,6 @@ func (l *Literals) Obfuscate(level string) error {
 
 	for _, pkg := range l.pkgs {
 		for _, file := range util.SortedSyntax(pkg) {
-			// Getting absolute path of file
 			absPath := pkg.Fset.File(file.Pos()).Name()
 			if strings.HasSuffix(absPath, "_test.go") {
 				continue
@@ -34,7 +36,6 @@ func (l *Literals) Obfuscate(level string) error {
 
 			l.log.Debug(l.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", absPath))
 
-			// Obfuscate literals in file with given obfuscation profile
 			if err := l.obfuscateAST(file, pkg.Fset, profile, pkg.TypesInfo); err != nil {
 				return fmt.Errorf(l.cfg.CurLocale["obf.err.lit"], absPath, err)
 			}
@@ -45,24 +46,34 @@ func (l *Literals) Obfuscate(level string) error {
 	return nil
 }
 
+// getObfuscationProfile maps a level string to its ObfuscateLiteralsProfile
+// implementation. Returns nil for unknown or unimplemented levels.
 func getObfuscationProfile(level string) ObfuscateLiteralsProfile {
 	switch level {
 	case "easy":
 		return &XorObfuscateLiteralsProfile{}
 	case "medium":
 		return &AESObfuscateLiteralsProfile{}
-	case "hard":
-		return nil
 	}
 	return nil
 }
 
+// obfuscateAST encrypts every eligible string literal in f. A decrypt function
+// is injected once per file and each literal is replaced with a call to it.
+//
+// Literals are skipped in the following cases:
+//   - Inside const declarations (must remain compile-time constants).
+//   - Struct field tags (stored as *ast.BasicLit but not replaceable with a call).
+//   - Import path specifications.
+//   - Already-wrapped calls to the decrypt function itself.
+//   - Type conversions (e.g. MyType("value")) where Fun is not a *types.Signature.
+//   - Compiler directives (strings starting with "//go:").
+//   - Empty strings ("") — replacing them breaks named-string-type assignments.
 func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile ObfuscateLiteralsProfile, typesInfo *types.Info) error {
 	decryptKey := profile.GenerateKey(l.cfg.Obfuscator.Seed)
 	decryptFuncName := util.GenerateUniqueName(l.r, l.used)
 	decryptFunc := profile.DecryptFunction(decryptKey, decryptFuncName)
 
-	// Проверка на наличие функции дешифровки
 	hasDecrypt := false
 	for _, decl := range f.Decls {
 		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == decryptFuncName {
@@ -71,7 +82,6 @@ func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile Obfusc
 		}
 	}
 
-	// Добавляем функцию дешифровки при необходимости
 	if !hasDecrypt {
 		fullCode := "package temp\n" + decryptFunc
 		extra, err := parser.ParseFile(fset, "", fullCode, 0)
@@ -89,23 +99,16 @@ func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile Obfusc
 		}
 	}
 
-	// Process literals in pre-handler to allow safe node replacement.
-	// Return false after replacement to skip traversing children of the new node.
 	astutil.Apply(f, func(cursor *astutil.Cursor) bool {
-		// Skip const declarations entirely — const values must be compile-time
-		// constants, and function calls are not allowed there.
 		if genDecl, ok := cursor.Node().(*ast.GenDecl); ok && genDecl.Tok == token.CONST {
 			return false
 		}
 
 		if lit, ok := cursor.Node().(*ast.BasicLit); ok && lit.Kind == token.STRING {
-			// Skip struct tags: they are stored as *ast.BasicLit in ast.Field.Tag,
-			// which is not an ast.Expr field and cannot be replaced with CallExpr.
 			if parent, ok := cursor.Parent().(*ast.Field); ok && parent.Tag == lit {
 				return true
 			}
 
-			// Skip import paths: they are also BasicLit but not replaceable with CallExpr
 			if _, ok := cursor.Parent().(*ast.ImportSpec); ok {
 				return true
 			}
@@ -115,20 +118,17 @@ func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile Obfusc
 				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == decryptFuncName {
 					return true
 				}
-				// Skip literals used as arguments to type conversions (e.g. TestType("value")).
-				// A type conversion has exactly one argument and Fun refers to a type, not a function.
-				// We use typesInfo to distinguish: if Fun's type is a *types.Signature, it's a
-				// function call (safe to obfuscate). If it's any other type, it's a conversion.
+				// Skip type conversions: if Fun's type is not a *types.Signature
+				// the call is a type conversion, not a function call.
 				if typesInfo != nil {
 					if tv, ok := typesInfo.Types[call.Fun]; ok {
 						if _, isSig := tv.Type.(*types.Signature); !isSig {
-							// Fun is a type, not a function — this is a type conversion, skip.
 							return true
 						}
 					}
 				} else {
-					// No type info: conservatively skip single-arg calls with bare Ident Fun
-					// (e.g. MyType("value")) but allow SelectorExpr calls (fmt.Printf etc.)
+					// Without type info, conservatively skip single-argument calls
+					// with a bare identifier Fun (e.g. MyType("value")).
 					if _, ok := call.Fun.(*ast.Ident); ok && len(call.Args) == 1 {
 						return true
 					}
@@ -140,8 +140,6 @@ func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile Obfusc
 			}
 
 			s, _ := strconv.Unquote(lit.Value)
-			// Skip empty strings — obfuscating "" produces DecryptFunc("") which
-			// returns string and breaks assignments to named string types (e.g. type TestType string).
 			if s == "" {
 				return true
 			}
@@ -165,12 +163,14 @@ func (l *Literals) obfuscateAST(f *ast.File, fset *token.FileSet, profile Obfusc
 	return nil
 }
 
+// isCompilerDirective reports whether the quoted string literal value s
+// represents a Go compiler directive (e.g. "//go:generate ...").
 func isCompilerDirective(s string) bool {
 	return len(s) > 4 && s[0:4] == `"//g`
 }
 
+// hasImport reports whether file f already imports the package at path.
 func hasImport(f *ast.File, path string) bool {
-	// Check if package is already imported
 	for _, imp := range f.Imports {
 		if cleanImportPath(imp.Path.Value) == path {
 			return true
@@ -179,11 +179,14 @@ func hasImport(f *ast.File, path string) bool {
 	return false
 }
 
+// cleanImportPath strips surrounding double-quotes from the raw import path
+// value as it appears in the AST (e.g. `"fmt"` → `fmt`).
 func cleanImportPath(s string) string {
-	// Clean import path from quotes
 	return strings.Trim(s, `"`)
 }
 
+// addImport adds an import for path to file f, creating an import declaration
+// block if one does not already exist.
 func addImport(f *ast.File, path string) {
 	importSpec := &ast.ImportSpec{
 		Path: &ast.BasicLit{
@@ -192,7 +195,6 @@ func addImport(f *ast.File, path string) {
 		},
 	}
 
-	// Find or create import declaration
 	var importDecl *ast.GenDecl
 	for _, decl := range f.Decls {
 		if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.IMPORT {
@@ -201,7 +203,6 @@ func addImport(f *ast.File, path string) {
 		}
 	}
 
-	// Add new import to file
 	if importDecl == nil {
 		importDecl = &ast.GenDecl{
 			Tok:   token.IMPORT,

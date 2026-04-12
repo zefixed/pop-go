@@ -7,9 +7,11 @@ import (
 	"time"
 )
 
-// RunTests executes `go test [extraFlags] ./...` in the specified directory.
-// stage is a human-readable label used in log messages (e.g. "pre-obfuscation" / "post-obfuscation").
-// extraFlags are inserted between "test" and "./..." (e.g. "-vet=off").
+// RunTests executes "go test [extraFlags...] ./..." in dir and reports the
+// outcome via the structured logger. stage is a human-readable label used in
+// log messages (e.g. the pre- or post-obfuscation stage name from the locale).
+// extraFlags are inserted between "test" and "./...", for example "-vet=off".
+// An error is returned if the test command exits with a non-zero status.
 func (t *Tester) RunTests(dir string, stage string, extraFlags ...string) error {
 	t.log.Info(
 		t.cfg.CurLocale["tst.info.start"],
