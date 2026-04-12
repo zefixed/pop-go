@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 )
 
+// TakeSnapshot returns the absolute paths of all regular files inside dir,
+// traversing subdirectories recursively. It is used to enumerate project
+// files without loading them into memory.
 func TakeSnapshot(dir string) ([]string, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {

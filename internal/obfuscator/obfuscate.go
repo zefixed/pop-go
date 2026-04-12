@@ -1,15 +1,22 @@
 package obfuscator
 
+// Obfuscate runs all enabled obfuscation passes in the correct order and
+// writes the transformed AST back to the temporary directory.
+//
+// Pass order matters:
+//  1. DeleteComments — must run first so subsequent passes see clean ASTs.
+//  2. RenameIdentifiers — must run before CFF because CFF creates synthetic
+//     AST nodes (hoisted var declarations) that are invisible to TypesInfo;
+//     renaming after CFF would leave those nodes with stale names.
+//  3. ControlFlow — runs after renaming so all hoisted names are already
+//     consistent with their usages.
+//  4. Literals — encrypts string constants after structural changes are final.
+//  5. WriteAll — serialises every modified AST file to disk.
 func (o *Obfuscator) Obfuscate() error {
-	// Deleting comments if flag is set
 	if o.cfg.Obfuscator.Comments.Enable {
 		o.DeleteComments()
 	}
 
-	// Renaming non-exported identifiers BEFORE control flow flattening.
-	// CFF creates new AST nodes (hoisted var declarations) that are invisible
-	// to typesInfo, so renameIdentifiers must run first — while the AST still
-	// matches typesInfo exactly.
 	if o.cfg.Obfuscator.Identifiers.Enable {
 		err := o.renameIdentifiers.Obfuscate()
 		if err != nil {
@@ -17,14 +24,10 @@ func (o *Obfuscator) Obfuscate() error {
 		}
 	}
 
-	// Applying control flow flattening AFTER renaming.
-	// At this point all identifiers are already renamed consistently,
-	// so hoisted var names will match their usages.
 	if o.cfg.Obfuscator.ControlFlow.Enable {
 		o.controlFlow.Obfuscate()
 	}
 
-	// Obfuscating literals if flag is set by level from config
 	if o.cfg.Obfuscator.Literals.Enable {
 		err := o.literals.Obfuscate(o.cfg.Obfuscator.Literals.Level)
 		if err != nil {
@@ -32,11 +35,5 @@ func (o *Obfuscator) Obfuscate() error {
 		}
 	}
 
-	// Writing changes to files
-	err := o.WriteAll()
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return o.WriteAll()
 }

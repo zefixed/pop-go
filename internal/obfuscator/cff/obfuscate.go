@@ -836,6 +836,8 @@ func (f *CFF) convertDefineToAssign(stmt ast.Stmt, hoistedVars map[string]bool) 
 	return stmt
 }
 
+// toExprs converts a slice of *ast.Ident pointers to a slice of ast.Expr
+// values, as required by ast.AssignStmt.Lhs and similar fields.
 func toExprs(idents []*ast.Ident) []ast.Expr {
 	exprs := make([]ast.Expr, len(idents))
 	for i, id := range idents {
@@ -954,6 +956,13 @@ func zeroValueForType(t ast.Expr) ast.Expr {
 	return &ast.Ident{Name: "nil"}
 }
 
+// typeToAST converts a types.Type to its corresponding ast.Expr representation.
+// Named types from the current package are emitted as bare identifiers; types
+// from other packages are emitted as selector expressions (pkg.Type) and their
+// import paths are recorded in imports for later injection. Anonymous structs
+// and interfaces fall back to struct{} and interface{} literals respectively.
+// Post-rename type names are resolved through currentNames (token.Pos → name)
+// so that the generated AST uses obfuscated names consistently.
 func (f *CFF) typeToAST(t types.Type, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) ast.Expr {
 	switch typ := t.(type) {
 	case *types.Basic:
@@ -1078,6 +1087,9 @@ func (f *CFF) typeToAST(t types.Type, currentPkgPath string, currentNames map[to
 	return &ast.Ident{Name: "interface{}"}
 }
 
+// signatureToAST converts a *types.Signature to an *ast.FuncType suitable for
+// use in a var declaration. Parameter and result types are resolved recursively
+// via typeToAST.
 func (f *CFF) signatureToAST(sig *types.Signature, currentPkgPath string, currentNames map[token.Pos]string, pkgAliases map[string]string, imports map[string]string) *ast.FuncType {
 	params := &ast.FieldList{}
 	if sig.Params() != nil {
@@ -1184,6 +1196,10 @@ func (f *CFF) hasGoto(stmts []ast.Stmt) bool {
 	return false
 }
 
+// hasAnonymousStructTypeAssertion reports whether any statement in stmts
+// contains a type assertion to an anonymous struct (e.g. v.(struct{ x int })).
+// Such assertions prevent CFF from converting the surrounding := to = because
+// the asserted type would need to be re-stated in the hoisted var declaration.
 func (f *CFF) hasAnonymousStructTypeAssertion(stmts []ast.Stmt) bool {
 	for _, stmt := range stmts {
 		found := false
@@ -1206,19 +1222,23 @@ func (f *CFF) hasAnonymousStructTypeAssertion(stmts []ast.Stmt) bool {
 	return false
 }
 
+// addImportsToFile adds any import paths in imports that are not already
+// present in file. Entries in imports map a local package name to its import
+// path (e.g. "http" → "net/http"). A parenthesised import block is created
+// if the file does not already contain one.
 func addImportsToFile(file *ast.File, imports map[string]string) {
 	if len(imports) == 0 {
 		return
 	}
 
-	// Собираем уже существующие импорты
+	// Collect already-present import paths to avoid duplicates.
 	existing := make(map[string]bool)
 	for _, imp := range file.Imports {
 		path := strings.Trim(imp.Path.Value, `"`)
 		existing[path] = true
 	}
 
-	// Находим или создаём import GenDecl
+	// Find or create the import GenDecl.
 	var importDecl *ast.GenDecl
 	for _, decl := range file.Decls {
 		if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.IMPORT {
@@ -1231,7 +1251,8 @@ func addImportsToFile(file *ast.File, imports map[string]string) {
 		file.Decls = append([]ast.Decl{importDecl}, file.Decls...)
 	}
 	if importDecl.Lparen == 0 {
-		importDecl.Lparen = 1 // включаем скобки чтобы можно было добавить импорты
+		// Enable parenthesised form so multiple specs can be appended.
+		importDecl.Lparen = 1
 	}
 
 	for _, importPath := range imports {

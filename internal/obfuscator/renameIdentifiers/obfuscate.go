@@ -1,25 +1,35 @@
 package renameIdentifiers
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
+	"go/format"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"pop-go/pkg/util"
 	"strings"
 	"time"
 )
 
-// A workaround to prevent the obfuscation of package names
-// that were not originally present in the source code but were injected by the obfuscator.
-// Need to fix this in the future.
+// standardPackageNames lists package names injected by the literals pass
+// (e.g. "aes", "cipher") that must not be renamed even though they appear as
+// unexported identifiers in the import-alias namespace.
+// TODO: replace with proper detection of injected import aliases.
 var standardPackageNames = map[string]bool{
 	"aes": true, "cipher": true,
 }
 
+// Obfuscate renames every eligible unexported identifier across all loaded
+// packages. For each package a rename map is built from the non-test source
+// files, applied to the in-memory AST, and then propagated to internal test
+// files via renameTestFiles.
 func (i *RenameIdentifiers) Obfuscate() error {
 	i.log.Info(i.cfg.CurLocale["obf.info.start.ren.ids"])
 	t := time.Now()
@@ -32,7 +42,7 @@ func (i *RenameIdentifiers) Obfuscate() error {
 			continue
 		}
 
-		// Build package-level rename map for consistent renaming across all files
+		// Build package-level rename map for consistent renaming across all files.
 		renameMap := i.buildRenameMap(pkg, pkg.PkgPath)
 
 		for _, file := range util.SortedSyntax(pkg) {
@@ -42,6 +52,13 @@ func (i *RenameIdentifiers) Obfuscate() error {
 			if err := i.applyRenameMap(file, pkg.TypesInfo, renameMap); err != nil {
 				return fmt.Errorf(i.cfg.CurLocale["obf.err.ren.ids"], absPath, err)
 			}
+		}
+
+		// Rename identifiers in _test.go files that belong to this package.
+		// Test files are not in pkg.Syntax when packages are loaded without Tests mode,
+		// so we find them by scanning the package directory and apply a name-based rename.
+		if err := i.renameTestFiles(pkg, renameMap); err != nil {
+			return err
 		}
 	}
 
@@ -236,8 +253,11 @@ func anonStructFieldKey(field *types.Var, typesInfo *types.Info) string {
 	return ""
 }
 
-// collectTypeSwitchVars collects all positions of type switch variables
-// including the declaration and all uses within case clauses
+// collectTypeSwitchVars returns the set of source positions occupied by type
+// switch variables — both the declaration site and every use within the switch
+// body. Variables bound by a type switch (e.g. "v" in "switch v := x.(type)")
+// implicitly change their type in each case clause. Renaming them would
+// produce conflicting declarations, so the rename pass skips all of them.
 func collectTypeSwitchVars(file *ast.File) map[token.Pos]bool {
 	vars := make(map[token.Pos]bool)
 
@@ -274,6 +294,9 @@ func collectTypeSwitchVars(file *ast.File) map[token.Pos]bool {
 	return vars
 }
 
+// applyRenameMap renames every identifier in f whose resolved types.Object
+// appears as a key in renameMap. The walk uses astutil.Apply so that cursor
+// replacements are applied immediately; returning true continues the traversal.
 func (i *RenameIdentifiers) applyRenameMap(f *ast.File, typesInfo *types.Info, renameMap map[types.Object]string) error {
 	astutil.Apply(f, nil, func(cursor *astutil.Cursor) bool {
 		ident, ok := cursor.Node().(*ast.Ident)
@@ -294,6 +317,152 @@ func (i *RenameIdentifiers) applyRenameMap(f *ast.File, typesInfo *types.Info, r
 	return nil
 }
 
+// renameTestFiles finds all internal _test.go files in pkg's directory
+// (those with "package <pkg.Name>", not "package <pkg.Name>_test")
+// and renames identifiers according to renameMap.
+//
+// Because packages.Load without the Tests flag does not include test files in
+// pkg.Syntax, we cannot use pkg.TypesInfo to resolve test-file identifiers.
+// Instead we build a name-based lookup from the package-scope rename map and
+// apply it to test files parsed fresh. This correctly handles the common case
+// of test files calling unexported package-level functions, types, and variables.
+//
+// Limitation: unexported struct fields that share the same base name across
+// multiple structs and were renamed to different identifiers cannot be
+// distinguished without type info; in that case the name is removed from the
+// lookup map and left unrenamed.
+func (i *RenameIdentifiers) renameTestFiles(pkg *packages.Package, renameMap map[types.Object]string) error {
+	if len(pkg.GoFiles) == 0 {
+		return nil
+	}
+
+	// ── Build name-based lookup ────────────────────────────────────────────
+	// We intentionally include ALL renamed objects (not only package-scope).
+	// Methods and struct fields are also accessible from internal test files.
+	// Conflict resolution: if the same original name maps to two different new
+	// names (e.g., field x in struct A → xa, field x in struct B → xb), we
+	// remove the entry to avoid silently producing an incorrect rename.
+	type nameEntry struct {
+		newName   string
+		conflicts bool
+	}
+	entries := make(map[string]*nameEntry)
+	for obj, newName := range renameMap {
+		origName := obj.Name()
+		if e, ok := entries[origName]; ok {
+			if e.newName != newName {
+				e.conflicts = true
+			}
+		} else {
+			entries[origName] = &nameEntry{newName: newName}
+		}
+	}
+	nameMap := make(map[string]string, len(entries))
+	for origName, e := range entries {
+		if !e.conflicts {
+			nameMap[origName] = e.newName
+		}
+	}
+	if len(nameMap) == 0 {
+		return nil
+	}
+
+	// ── Scan directory for internal _test.go files ─────────────────────────
+	dir := filepath.Dir(pkg.GoFiles[0])
+
+	dirEntries, err := os.ReadDir(dir)
+	if err != nil {
+		// Not critical — just skip
+		return nil
+	}
+
+	fset := token.NewFileSet()
+
+	for _, de := range dirEntries {
+		if de.IsDir() || !strings.HasSuffix(de.Name(), "_test.go") {
+			continue
+		}
+
+		testPath := filepath.Join(dir, de.Name())
+
+		f, err := parser.ParseFile(fset, testPath, nil, parser.ParseComments)
+		if err != nil {
+			i.log.Warn("failed to parse test file",
+				slog.String("file", testPath),
+				slog.String("error", err.Error()))
+			continue
+		}
+
+		// Only process internal test files (same package name).
+		// External test files (package foo_test) can only access exported
+		// identifiers which we never rename, so they need no changes.
+		if f.Name == nil || f.Name.Name != pkg.Name {
+			continue
+		}
+
+		i.log.Debug(i.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", testPath))
+
+		i.applyNameRenameMap(f, nameMap)
+
+		var buf bytes.Buffer
+		if err := format.Node(&buf, fset, f); err != nil {
+			i.log.Warn("failed to format test file",
+				slog.String("file", testPath),
+				slog.String("error", err.Error()))
+			continue
+		}
+
+		if err := os.WriteFile(testPath, buf.Bytes(), 0644); err != nil {
+			return fmt.Errorf("failed to write test file %s: %w", testPath, err)
+		}
+	}
+
+	return nil
+}
+
+// applyNameRenameMap walks the AST of f and renames any unexported identifier
+// whose name appears in nameMap.  It skips the package declaration, exported
+// identifiers, builtin names, and the blank identifier.
+func (i *RenameIdentifiers) applyNameRenameMap(f *ast.File, nameMap map[string]string) {
+	pkgNamePos := token.NoPos
+	if f.Name != nil {
+		pkgNamePos = f.Name.Pos()
+	}
+
+	astutil.Apply(f, nil, func(cursor *astutil.Cursor) bool {
+		ident, ok := cursor.Node().(*ast.Ident)
+		if !ok || ident == nil {
+			return true
+		}
+
+		// Skip package declaration
+		if ident.Pos() == pkgNamePos {
+			return true
+		}
+
+		// Never rename exported, blank, or special identifiers
+		name := ident.Name
+		if ast.IsExported(name) || name == "_" || name == "init" || name == "main" {
+			return true
+		}
+
+		if isBuiltinType(name) {
+			return true
+		}
+
+		if newName, exists := nameMap[name]; exists {
+			ident.Name = newName
+		}
+
+		return true
+	})
+}
+
+// collectImportedNames returns the set of local package names introduced by
+// the import declarations of files. Both aliased imports (import foo "pkg")
+// and non-aliased imports (where the local name equals the last path segment)
+// are included. These names must not be renamed because they are references to
+// external packages, not declarations in the current package.
 func (i *RenameIdentifiers) collectImportedNames(files []*ast.File) map[string]bool {
 	importedNames := make(map[string]bool)
 	for _, f := range files {
@@ -312,6 +481,10 @@ func (i *RenameIdentifiers) collectImportedNames(files []*ast.File) map[string]b
 	return importedNames
 }
 
+// shouldRename reports whether ident is eligible for renaming. An identifier
+// is skipped when it is exported, is a blank identifier, is a builtin name, is
+// the package declaration itself, refers to an imported package name, belongs
+// to a different package, or belongs to a standard-library package path.
 func shouldRename(ident *ast.Ident, file *ast.File, typesInfo *types.Info, currentPkgPath string, importedNames map[string]bool) bool {
 	name := ident.Name
 	if ast.IsExported(name) {
@@ -356,6 +529,9 @@ func shouldRename(ident *ast.Ident, file *ast.File, typesInfo *types.Info, curre
 	return true
 }
 
+// isBuiltinType reports whether name is a predeclared Go identifier: a builtin
+// type, builtin function, or predeclared constant. Such identifiers must never
+// be renamed because they are not user-defined declarations.
 func isBuiltinType(name string) bool {
 	builtins := map[string]bool{
 		"bool": true, "byte": true, "complex64": true, "complex128": true,
@@ -372,6 +548,10 @@ func isBuiltinType(name string) bool {
 	return builtins[name]
 }
 
+// isStandardPackagePath reports whether path is a standard-library import path.
+// Standard-library paths contain no dots, are non-empty, and do not start with
+// "vendor/". The currentPkgPath check avoids misidentifying the package under
+// obfuscation as a stdlib package.
 func isStandardPackagePath(path, currentPkgPath string) bool {
 	if path == "" || path == currentPkgPath {
 		return false

@@ -8,6 +8,9 @@ import (
 	"os"
 )
 
+// WriteAll serialises every modified AST file back to disk using go/format.
+// It iterates over all canonical packages and writes the formatted source of
+// each file in pkg.Syntax to its original absolute path in the temp directory.
 func (o *Obfuscator) WriteAll() error {
 	o.log.Info(o.cfg.CurLocale["obf.info.writing.files"])
 	for _, pkg := range o.pkgs {

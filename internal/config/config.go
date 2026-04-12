@@ -1,3 +1,5 @@
+// Package config wires the Cobra CLI commands to the Viper configuration
+// subsystem and exposes Execute as the single entry point for the program.
 package config
 
 import (
@@ -14,27 +16,27 @@ import (
 	"github.com/spf13/viper"
 )
 
+// validateConfig checks that all fields in the package-level cfg variable are
+// coherent before the obfuscation run starts. It verifies locale availability,
+// required path existence, and the allowed values for log level, log type,
+// literal obfuscation level, GOOS, and GOARCH.
 func validateConfig() error {
-	// Getting available locales
 	langs, err := pkgfs.TakeSnapshot("./locales")
 	if err != nil {
 		return fmt.Errorf("error reading locales directory: %w", err)
 	}
 
-	// Trimming path
 	for i, lang := range langs {
 		_, name := filepath.Split(lang)
 		langs[i] = name
 	}
 
-	// Checking that the specified locale is present in the ./locales
 	if !slices.ContainsFunc(langs, func(s string) bool {
 		return cfg.App.Lang == strings.TrimSuffix(s, ".yaml")
 	}) {
 		return fmt.Errorf("unknown language %q", cfg.App.Lang)
 	}
 
-	// Checking that all the directories specified in the config exist
 	paths := map[string]string{
 		"target_path": cfg.Obfuscator.TargetPath,
 		"output_path": cfg.Builder.OutputPath,
@@ -54,7 +56,6 @@ func validateConfig() error {
 		}
 	}
 
-	// Checking that log level is correct
 	logLevels := []string{"debug", "info", "warn", "error"}
 	if !slices.Contains(logLevels, cfg.Log.Level) {
 		return fmt.Errorf(
@@ -64,7 +65,6 @@ func validateConfig() error {
 		)
 	}
 
-	// Checking that log type is correct
 	logTypes := []string{"json", "text"}
 	if !slices.Contains(logTypes, cfg.Log.Type) {
 		return fmt.Errorf(
@@ -74,7 +74,6 @@ func validateConfig() error {
 		)
 	}
 
-	// Checking that obfuscation literals level is correct
 	literalsLevel := []string{"easy", "medium"}
 	if cfg.Obfuscator.Literals.Level != "" {
 		if !slices.Contains(literalsLevel, cfg.Obfuscator.Literals.Level) {
@@ -88,7 +87,6 @@ func validateConfig() error {
 		return errors.New("obfuscating literals is enabled but level is empty")
 	}
 
-	// Checking that GOOS is correct
 	goos := []string{"aix", "android", "darwin", "dragonfly", "freebsd", "illumos", "ios", "js", "linux", "netbsd", "openbsd", "plan9", "solaris", "wasip1", "windows"}
 	if !slices.Contains(goos, cfg.Builder.GOOS) {
 		return fmt.Errorf(
@@ -98,7 +96,6 @@ func validateConfig() error {
 		)
 	}
 
-	// Checking that GOARCH is correct
 	goarch := []string{"386", "amd64", "arm", "arm64", "loong64", "mips", "mips64", "mips64le", "mipsle", "ppc64", "ppc64le", "riscv64", "s390x", "wasm"}
 	if !slices.Contains(goarch, cfg.Builder.GOARCH) {
 		return fmt.Errorf(
@@ -143,10 +140,13 @@ var (
 	}
 )
 
+// Execute runs the root Cobra command and returns any error it produces.
 func Execute() error {
 	return rootCmd.Execute()
 }
 
+// init registers all flag groups and binds them to Viper keys so that CLI
+// flags take precedence over values read from a JSON config file.
 func init() {
 	initConfigPath()
 	initApp()
@@ -158,6 +158,9 @@ func init() {
 	_ = viper.BindPFlags(rootCmd.PersistentFlags())
 }
 
+// initViperConfig loads the JSON config file from configPath into Viper when a
+// path was provided. CLI flags registered afterwards will still override any
+// values from the file.
 func initViperConfig() error {
 	if configPath == "" {
 		return nil
@@ -170,11 +173,15 @@ func initViperConfig() error {
 	return nil
 }
 
+// initConfigPath registers the --config / -c persistent flag and binds it to
+// the config_path Viper key.
 func initConfigPath() {
 	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "", "The path to the config file. If a path is specified, the config will be loaded from the file, and then the parameters passed by the flags will be overwritten.")
 	_ = viper.BindPFlag("config_path", rootCmd.PersistentFlags().Lookup("config"))
 }
 
+// initApp registers application-level flags: language, temp directory,
+// temp-cleanup behaviour, and test toggle.
 func initApp() {
 	var lang, tempDir string
 	var removeTemp, test bool
@@ -188,6 +195,8 @@ func initApp() {
 	_ = viper.BindPFlag("app.test", rootCmd.Flags().Lookup("test"))
 }
 
+// initLog registers logging flags: level, output type, file logging toggle,
+// and log file path.
 func initLog() {
 	var level, logType, file string
 	var enableFile bool
@@ -201,6 +210,8 @@ func initLog() {
 	_ = viper.BindPFlag("log.file", rootCmd.Flags().Lookup("log-file"))
 }
 
+// initObfuscator registers the target-path and seed flags, then delegates to
+// sub-init functions for each obfuscation pass.
 func initObfuscator() {
 	var targetPath string
 	var seed int64
@@ -214,12 +225,14 @@ func initObfuscator() {
 	initControlFlow()
 }
 
+// initComments registers the --delete-comments flag.
 func initComments() {
 	var enable bool
 	rootCmd.Flags().BoolVar(&enable, "delete-comments", false, "Removes comments from source code.")
 	_ = viper.BindPFlag("obfuscator.comments.enable", rootCmd.Flags().Lookup("delete-comments"))
 }
 
+// initLiterals registers the --literals and --literals-level flags.
 func initLiterals() {
 	var enable bool
 	var level string
@@ -229,18 +242,22 @@ func initLiterals() {
 	_ = viper.BindPFlag("obfuscator.literals.level", rootCmd.Flags().Lookup("literals-level"))
 }
 
+// initIdentifiers registers the --identifiers flag.
 func initIdentifiers() {
 	var enable bool
 	rootCmd.Flags().BoolVar(&enable, "identifiers", false, "Renames non-exported identifiers.")
 	_ = viper.BindPFlag("obfuscator.identifiers.enable", rootCmd.Flags().Lookup("identifiers"))
 }
 
+// initControlFlow registers the --control-flow flag.
 func initControlFlow() {
 	var enable bool
 	rootCmd.Flags().BoolVar(&enable, "control-flow", false, "Enables control flow flattening obfuscation technique.")
 	_ = viper.BindPFlag("obfuscator.control_flow.enable", rootCmd.Flags().Lookup("control-flow"))
 }
 
+// initBuilder registers build flags: extra compiler flags, target OS/arch,
+// output path, and binary name.
 func initBuilder() {
 	var flags []string
 	var goos, goarch, outputPath, binaryName string

@@ -1,3 +1,5 @@
+// Package log configures a structured [slog.Logger] from the application
+// settings and returns a closer that flushes and releases any open file sink.
 package log
 
 import (
@@ -9,6 +11,10 @@ import (
 	"strings"
 )
 
+// SetupLogger creates and returns a [slog.Logger] whose verbosity and output
+// format are controlled by cfg. When file logging is enabled, output is written
+// to both stdout and the configured log file. The returned closer must be called
+// on shutdown to sync and close the file.
 func SetupLogger(cfg *models.Config) (*slog.Logger, func() error, error) {
 	level := getLogLevel(strings.TrimSpace(cfg.Log.Level))
 
@@ -38,7 +44,6 @@ func SetupLogger(cfg *models.Config) (*slog.Logger, func() error, error) {
 		}
 	}
 
-	var log *slog.Logger
 	var handler slog.Handler
 
 	switch strings.TrimSpace(cfg.Log.Type) {
@@ -50,10 +55,11 @@ func SetupLogger(cfg *models.Config) (*slog.Logger, func() error, error) {
 		return nil, closer, fmt.Errorf("%s: %v", cfg.CurLocale["log.err.invalid.type"], cfg.Log.Type)
 	}
 
-	log = slog.New(handler)
-	return log, closer, nil
+	return slog.New(handler), closer, nil
 }
 
+// getLogLevel maps a lowercase level string to the corresponding [slog.Level].
+// Returns nil for unrecognised values so the caller can produce a meaningful error.
 func getLogLevel(level string) *slog.Level {
 	var lvl slog.Level
 	switch level {
