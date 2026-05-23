@@ -891,6 +891,11 @@ func (f *CFF) zeroValueForTypesType(t types.Type, currentPkgPath string, current
 		if _, isIface := typ.Underlying().(*types.Interface); isIface {
 			return &ast.Ident{Name: "nil"}
 		}
+		// Named function type (e.g. type lexFn func(*lexer) lexFn) → nil.
+		// A composite literal TypeName{} is invalid for function types.
+		if _, isSig := typ.Underlying().(*types.Signature); isSig {
+			return &ast.Ident{Name: "nil"}
+		}
 		// Named struct or alias → zero composite literal using the AST type expression.
 		return &ast.CompositeLit{Type: f.typeToAST(t, currentPkgPath, currentNames, pkgAliases, imports)}
 	case *types.Struct:
