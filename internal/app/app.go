@@ -6,6 +6,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -31,13 +32,13 @@ func Run(cfg *models.Config) error {
 
 	locale, err := loadLocales(cfg)
 	if err != nil {
-		return fmt.Errorf(fmt.Sprintf("error loading locales: %v", err))
+		return fmt.Errorf("error loading locales: %w", err)
 	}
 	cfg.CurLocale = *locale
 
 	log, closer, err := pkglog.SetupLogger(cfg)
 	if err != nil {
-		return fmt.Errorf(fmt.Sprintf("%s: %v", cfg.CurLocale["app.err.setup.logger"], err))
+		return fmt.Errorf("%s: %w", cfg.CurLocale["app.err.setup.logger"], err)
 	}
 	defer closer()
 
@@ -67,13 +68,13 @@ func Run(cfg *models.Config) error {
 		t := tester.NewTester(cfg, log)
 		if err = t.RunTests(cfg.Obfuscator.TargetPath, cfg.CurLocale["tst.stage.pre"]); err != nil {
 			stop()
-			return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
+			return errors.New(cfg.CurLocale["app.err.shutdown"])
 		}
 	}
 
 	err = fs.CopyDir(cfg.Obfuscator.TargetPath, dir)
 	if err != nil {
-		return fmt.Errorf(fmt.Sprintf("%s: %s", cfg.CurLocale["app.err.copy.temp.dir"], err))
+		return fmt.Errorf("%s: %w", cfg.CurLocale["app.err.copy.temp.dir"], err)
 	}
 	cfg.Obfuscator.TargetPath = dir
 
@@ -81,12 +82,12 @@ func Run(cfg *models.Config) error {
 	if obf.CritErr != nil {
 		stop()
 		log.Error(obf.CritErr.Error())
-		return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
+		return errors.New(cfg.CurLocale["app.err.shutdown"])
 	}
 	err = obf.Obfuscate()
 	if err != nil {
 		log.Error(err.Error())
-		return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
+		return errors.New(cfg.CurLocale["app.err.shutdown"])
 	}
 
 	// Post-obfuscation tests run with -vet=off because obfuscation legitimately
@@ -95,14 +96,14 @@ func Run(cfg *models.Config) error {
 		t := tester.NewTester(cfg, log)
 		if err = t.RunTests(cfg.Obfuscator.TargetPath, cfg.CurLocale["tst.stage.post"], "-vet=off"); err != nil {
 			stop()
-			return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
+			return errors.New(cfg.CurLocale["app.err.shutdown"])
 		}
 	}
 
 	err = builder.NewBuilder(cfg, log).Build()
 	if err != nil {
 		stop()
-		return fmt.Errorf(cfg.CurLocale["app.err.shutdown"])
+		return errors.New(cfg.CurLocale["app.err.shutdown"])
 	}
 
 	stop()

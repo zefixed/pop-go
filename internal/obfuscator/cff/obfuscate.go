@@ -885,18 +885,24 @@ func (f *CFF) zeroValueForTypesType(t types.Type, currentPkgPath string, current
 	case *types.Interface:
 		// All interfaces (error, io.Reader, cipher.AEAD, …) → nil.
 		return &ast.Ident{Name: "nil"}
+	case *types.TypeParam:
+		return zeroExprForTypeAST(f.typeToAST(typ, currentPkgPath, currentNames, pkgAliases, imports))
 	case *types.Named:
 		// Check underlying first — a named interface (e.g. type MyErr interface{…})
 		// must also return nil.
 		if _, isIface := typ.Underlying().(*types.Interface); isIface {
 			return &ast.Ident{Name: "nil"}
 		}
-		// Named struct or alias → zero composite literal using the AST type expression.
-		return &ast.CompositeLit{Type: f.typeToAST(t, currentPkgPath, currentNames, pkgAliases, imports)}
+		// Named function type (e.g. type lexFn func(*lexer) lexFn) → nil.
+		// A composite literal TypeName{} is invalid for function types.
+		if _, isSig := typ.Underlying().(*types.Signature); isSig {
+			return &ast.Ident{Name: "nil"}
+		}
+		return zeroExprForTypeAST(f.typeToAST(t, currentPkgPath, currentNames, pkgAliases, imports))
 	case *types.Struct:
 		return &ast.CompositeLit{Type: f.typeToAST(t, currentPkgPath, currentNames, pkgAliases, imports)}
 	case *types.Alias:
-		return f.zeroValueForTypesType(types.Unalias(typ), currentPkgPath, currentNames, pkgAliases, imports)
+		return zeroExprForTypeAST(f.typeToAST(typ, currentPkgPath, currentNames, pkgAliases, imports))
 	}
 	return &ast.Ident{Name: "nil"}
 }
@@ -938,8 +944,7 @@ func zeroValueForType(t ast.Expr) ast.Expr {
 			"complex64", "complex128":
 			return &ast.BasicLit{Kind: token.INT, Value: "0"}
 		default:
-			// Named type — return zero composite literal: TypeName{}
-			return &ast.CompositeLit{Type: t}
+			return zeroExprForTypeAST(t)
 		}
 	case *ast.StarExpr:
 		return &ast.Ident{Name: "nil"}
@@ -948,12 +953,23 @@ func zeroValueForType(t ast.Expr) ast.Expr {
 	case *ast.InterfaceType:
 		return &ast.Ident{Name: "nil"}
 	case *ast.SelectorExpr:
-		// Qualified type from another package (e.g. time.Duration, http.Handler)
-		return &ast.CompositeLit{Type: t}
+		return zeroExprForTypeAST(t)
 	case *ast.StructType:
 		return &ast.CompositeLit{Type: t}
 	}
 	return &ast.Ident{Name: "nil"}
+}
+
+// zeroExprForTypeAST builds a universally valid zero-value expression for a type.
+// `*new(T)` is valid for named numeric types, aliases, type parameters, pointers,
+// slices, maps, arrays, and structs without relying on composite literal syntax.
+func zeroExprForTypeAST(t ast.Expr) ast.Expr {
+	return &ast.StarExpr{
+		X: &ast.CallExpr{
+			Fun:  &ast.Ident{Name: "new"},
+			Args: []ast.Expr{t},
+		},
+	}
 }
 
 // typeToAST converts a types.Type to its corresponding ast.Expr representation.
@@ -1057,6 +1073,11 @@ func (f *CFF) typeToAST(t types.Type, currentPkgPath string, currentNames map[to
 			}
 		}
 		return &ast.Ident{Name: typeName}
+	case *types.TypeParam:
+		if obj := typ.Obj(); obj != nil {
+			return &ast.Ident{Name: obj.Name()}
+		}
+		return &ast.Ident{Name: "interface{}"}
 	case *types.Signature:
 		return f.signatureToAST(typ, currentPkgPath, currentNames, pkgAliases, imports)
 	case *types.Struct:
