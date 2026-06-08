@@ -106,7 +106,7 @@ func (i *RenameIdentifiers) buildRenameMap(pkg *packages.Package, currentPkgPath
 				return true
 			}
 
-			obj := pkg.TypesInfo.ObjectOf(ident)
+			obj := canonicalObject(pkg.TypesInfo.ObjectOf(ident))
 			if obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == currentPkgPath {
 
 				// ── Embedded (anonymous) field synchronisation ───────────────────
@@ -298,15 +298,27 @@ func collectTypeSwitchVars(file *ast.File) map[token.Pos]bool {
 // appears as a key in renameMap. The walk uses astutil.Apply so that cursor
 // replacements are applied immediately; returning true continues the traversal.
 func (i *RenameIdentifiers) applyRenameMap(f *ast.File, typesInfo *types.Info, renameMap map[types.Object]string) error {
+	posRenameMap := make(map[token.Pos]string, len(renameMap))
+	for obj, newName := range renameMap {
+		if obj != nil && obj.Pos() != token.NoPos {
+			posRenameMap[obj.Pos()] = newName
+		}
+	}
+
 	astutil.Apply(f, nil, func(cursor *astutil.Cursor) bool {
 		ident, ok := cursor.Node().(*ast.Ident)
 		if !ok || ident == nil {
 			return true
 		}
 
-		obj := typesInfo.ObjectOf(ident)
+		obj := canonicalObject(typesInfo.ObjectOf(ident))
 		if obj != nil {
 			if newName, exists := renameMap[obj]; exists {
+				ident.Name = newName
+			} else if newName, exists := posRenameMap[obj.Pos()]; exists {
+				// Generic instantiations can materialize fresh field objects for uses in
+				// keyed composite literals and selectors. Their declaration position stays
+				// stable, so fall back to Pos() to keep the use-site name in sync.
 				ident.Name = newName
 			}
 		}
@@ -315,6 +327,17 @@ func (i *RenameIdentifiers) applyRenameMap(f *ast.File, typesInfo *types.Info, r
 	})
 
 	return nil
+}
+
+func canonicalObject(obj types.Object) types.Object {
+	switch o := obj.(type) {
+	case *types.Var:
+		return o.Origin()
+	case *types.Func:
+		return o.Origin()
+	default:
+		return obj
+	}
 }
 
 // renameTestFiles finds all internal _test.go files in pkg's directory
@@ -367,6 +390,8 @@ func (i *RenameIdentifiers) renameTestFiles(pkg *packages.Package, renameMap map
 		return nil
 	}
 
+	structFieldMap := i.buildStructFieldRenameMap(pkg, renameMap)
+
 	// ── Scan directory for internal _test.go files ─────────────────────────
 	dir := filepath.Dir(pkg.GoFiles[0])
 
@@ -403,6 +428,7 @@ func (i *RenameIdentifiers) renameTestFiles(pkg *packages.Package, renameMap map
 		i.log.Debug(i.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", testPath))
 
 		i.applyNameRenameMap(f, nameMap)
+		i.applyStructFieldRenameMap(f, structFieldMap)
 
 		var buf bytes.Buffer
 		if err := format.Node(&buf, fset, f); err != nil {
@@ -418,6 +444,58 @@ func (i *RenameIdentifiers) renameTestFiles(pkg *packages.Package, renameMap map
 	}
 
 	return nil
+}
+
+func (i *RenameIdentifiers) buildStructFieldRenameMap(pkg *packages.Package, renameMap map[types.Object]string) map[string]map[string]string {
+	typeMaps := make(map[string]map[string]string)
+
+	for _, file := range util.SortedSyntax(pkg) {
+		ast.Inspect(file, func(n ast.Node) bool {
+			ts, ok := n.(*ast.TypeSpec)
+			if !ok {
+				return true
+			}
+			st, ok := ts.Type.(*ast.StructType)
+			if !ok {
+				return true
+			}
+
+			typeNames := []string{ts.Name.Name}
+			if obj := pkg.TypesInfo.Defs[ts.Name]; obj != nil {
+				typeNames[0] = obj.Name()
+				if newName, ok := renameMap[obj]; ok && newName != obj.Name() {
+					typeNames = append(typeNames, newName)
+				}
+			}
+
+			fieldRenames := make(map[string]string)
+			for _, field := range st.Fields.List {
+				for _, name := range field.Names {
+					if name == nil {
+						continue
+					}
+					obj := canonicalObject(pkg.TypesInfo.Defs[name])
+					if obj == nil {
+						continue
+					}
+					if newName, ok := renameMap[obj]; ok && newName != obj.Name() {
+						fieldRenames[obj.Name()] = newName
+					}
+				}
+			}
+
+			if len(fieldRenames) == 0 {
+				return true
+			}
+
+			for _, typeName := range typeNames {
+				typeMaps[typeName] = fieldRenames
+			}
+			return true
+		})
+	}
+
+	return typeMaps
 }
 
 // applyNameRenameMap walks the AST of f and renames any unexported identifier
@@ -456,6 +534,56 @@ func (i *RenameIdentifiers) applyNameRenameMap(f *ast.File, nameMap map[string]s
 
 		return true
 	})
+}
+
+func (i *RenameIdentifiers) applyStructFieldRenameMap(f *ast.File, structFieldMap map[string]map[string]string) {
+	ast.Inspect(f, func(n ast.Node) bool {
+		cl, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+
+		typeName := compositeLitTypeName(cl.Type)
+		if typeName == "" {
+			return true
+		}
+
+		fieldMap, ok := structFieldMap[typeName]
+		if !ok {
+			return true
+		}
+
+		for _, elt := range cl.Elts {
+			kv, ok := elt.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, ok := kv.Key.(*ast.Ident)
+			if !ok {
+				continue
+			}
+			if newName, ok := fieldMap[key.Name]; ok {
+				key.Name = newName
+			}
+		}
+
+		return true
+	})
+}
+
+func compositeLitTypeName(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.SelectorExpr:
+		return t.Sel.Name
+	case *ast.IndexExpr:
+		return compositeLitTypeName(t.X)
+	case *ast.IndexListExpr:
+		return compositeLitTypeName(t.X)
+	default:
+		return ""
+	}
 }
 
 // collectImportedNames returns the set of local package names introduced by
