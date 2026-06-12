@@ -7,6 +7,7 @@ import (
 	"go/format"
 	"log/slog"
 	"os"
+	"pop-go/pkg/util"
 	"time"
 )
 
@@ -25,7 +26,7 @@ func (o *Obfuscator) DeleteComments() {
 			continue
 		}
 
-		for _, file := range pkg.Syntax {
+		for _, file := range util.SortedSyntax(pkg) {
 			filename := pkg.Fset.File(file.Pos()).Name()
 			o.log.Debug(o.cfg.CurLocale["obf.debug.processing.file"], slog.String("filename", filename))
 

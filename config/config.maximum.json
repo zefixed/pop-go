@@ -32,7 +32,7 @@
   },
   "builder": {
     "flags": ["-ldflags", "-s -w", "-trimpath"],
-    "goos": "windows",
+    "goos": "linux",
     "goarch": "amd64",
     "output_path": ".",
     "binary_name": "output"

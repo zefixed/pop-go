@@ -7,6 +7,7 @@ import (
 	"go/types"
 	"log/slog"
 	"pop-go/pkg/util"
+	"sort"
 	"strings"
 	"time"
 
@@ -282,7 +283,8 @@ func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliase
 	}
 
 	var hoistedDecls []ast.Stmt
-	for _, v := range varInfoMap {
+	hoistedNames := make([]string, 0, len(varInfoMap))
+	for name, v := range varInfoMap {
 		if v.IsParam {
 			continue
 		}
@@ -291,6 +293,12 @@ func (f *CFF) flattenFunction(fn *ast.FuncDecl, pkg *packages.Package, pkgAliase
 		if v.Name == "_" {
 			continue
 		}
+		hoistedNames = append(hoistedNames, name)
+	}
+	sort.Strings(hoistedNames)
+
+	for _, name := range hoistedNames {
+		v := varInfoMap[name]
 		hoistedVars[v.Name] = true
 		hoistedDecls = append(hoistedDecls, &ast.DeclStmt{
 			Decl: &ast.GenDecl{
@@ -961,14 +969,36 @@ func zeroValueForType(t ast.Expr) ast.Expr {
 }
 
 // zeroExprForTypeAST builds a universally valid zero-value expression for a type.
-// `*new(T)` is valid for named numeric types, aliases, type parameters, pointers,
-// slices, maps, arrays, and structs without relying on composite literal syntax.
+// It uses an immediately-invoked function literal so the expression remains valid
+// for named basic types, aliases, type parameters, pointers, slices, maps, arrays,
+// structs, and interfaces without depending on the builtin `new` identifier.
 func zeroExprForTypeAST(t ast.Expr) ast.Expr {
-	return &ast.StarExpr{
-		X: &ast.CallExpr{
-			Fun:  &ast.Ident{Name: "new"},
-			Args: []ast.Expr{t},
+	return &ast.CallExpr{
+		Fun: &ast.FuncLit{
+			Type: &ast.FuncType{
+				Params:  &ast.FieldList{},
+				Results: &ast.FieldList{List: []*ast.Field{{Type: t}}},
+			},
+			Body: &ast.BlockStmt{
+				List: []ast.Stmt{
+					&ast.DeclStmt{
+						Decl: &ast.GenDecl{
+							Tok: token.VAR,
+							Specs: []ast.Spec{
+								&ast.ValueSpec{
+									Names: []*ast.Ident{{Name: "zero"}},
+									Type:  t,
+								},
+							},
+						},
+					},
+					&ast.ReturnStmt{
+						Results: []ast.Expr{&ast.Ident{Name: "zero"}},
+					},
+				},
+			},
 		},
+		Args: []ast.Expr{},
 	}
 }
 
@@ -1276,7 +1306,16 @@ func addImportsToFile(file *ast.File, imports map[string]string) {
 		importDecl.Lparen = 1
 	}
 
+	importPaths := make([]string, 0, len(imports))
 	for _, importPath := range imports {
+		if existing[importPath] {
+			continue
+		}
+		importPaths = append(importPaths, importPath)
+	}
+	sort.Strings(importPaths)
+
+	for _, importPath := range importPaths {
 		if existing[importPath] {
 			continue
 		}

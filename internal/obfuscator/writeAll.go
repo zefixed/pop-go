@@ -6,6 +6,7 @@ import (
 	"go/format"
 	"log/slog"
 	"os"
+	"pop-go/pkg/util"
 )
 
 // WriteAll serialises every modified AST file back to disk using go/format.
@@ -18,7 +19,7 @@ func (o *Obfuscator) WriteAll() error {
 			continue
 		}
 
-		for _, file := range pkg.Syntax {
+		for _, file := range util.SortedSyntax(pkg) {
 			filePath := pkg.Fset.File(file.Pos()).Name()
 			o.log.Debug(o.cfg.CurLocale["obf.debug.writing.file"], slog.String("filename", filePath))
 
